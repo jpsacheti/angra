@@ -1,0 +1,25 @@
+# Rust build output
+/target/
+
+# Generated Angra project lockfiles
+angra.lock
+**/angra.lock
+
+# Benchmark output
+/benches/results/
+**/.gradle/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log

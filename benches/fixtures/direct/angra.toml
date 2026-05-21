@@ -1,0 +1,7 @@
+[project]
+group = "dev.angra.bench"
+artifact = "direct"
+version = "0.1.0"
+
+[dependencies]
+slf4j = "org.slf4j:slf4j-api:2.0.13"

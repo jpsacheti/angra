@@ -1,0 +1,8 @@
+[project]
+group = "dev.angra.bench"
+artifact = "conflict"
+version = "0.1.0"
+
+[dependencies]
+commons_lang3 = "org.apache.commons:commons-lang3:3.14.0"
+commons_text = "org.apache.commons:commons-text:1.11.0"

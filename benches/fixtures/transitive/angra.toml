@@ -1,0 +1,7 @@
+[project]
+group = "dev.angra.bench"
+artifact = "transitive"
+version = "0.1.0"
+
+[dependencies]
+guava = "com.google.guava:guava:33.0.0-jre"
