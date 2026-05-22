@@ -1,7 +1,14 @@
 use std::path::PathBuf;
 
-use angra::{ResolveOptions, resolve_project};
+use angra::{ResolveError, ResolveOptions, maven::ArtifactCoordinate, resolve_project};
 use clap::{Parser, Subcommand};
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const CYAN: &str = "\x1b[36m";
 
 #[derive(Debug, Parser)]
 #[command(name = "angra")]
@@ -31,12 +38,12 @@ enum Command {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("error: {error}");
+        print_error(&error);
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<(), ResolveError> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -53,11 +60,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             })?;
 
             println!(
-                "resolved {} artifacts into angra.lock",
-                lockfile.artifacts.len()
+                "{} resolved {} artifacts into {}",
+                paint("success:", GREEN),
+                paint(&lockfile.artifacts.len().to_string(), BOLD),
+                paint("angra.lock", CYAN)
             );
         }
     }
 
     Ok(())
+}
+
+fn print_error(error: &ResolveError) {
+    eprintln!(
+        "{} {}",
+        paint("error:", &format!("{BOLD}{RED}")),
+        error.root_cause()
+    );
+
+    if let Some(path) = error.dependency_path()
+        && !path.is_empty()
+    {
+        eprintln!();
+        eprintln!("{}", paint("dependency path:", BOLD));
+        eprintln!("  {}", format_dependency_path(path));
+    }
+}
+
+fn format_dependency_path(path: &[ArtifactCoordinate]) -> String {
+    path.iter()
+        .map(|artifact| paint(&artifact.to_string(), CYAN))
+        .collect::<Vec<_>>()
+        .join(&format!(" {} ", paint("->", DIM)))
+}
+
+fn paint(value: &str, style: &str) -> String {
+    format!("{style}{value}{RESET}")
 }

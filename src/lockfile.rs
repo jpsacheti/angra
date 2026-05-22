@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::maven::{Coordinate, Scope};
+use crate::maven::{ArtifactCoordinate, ArtifactType, Scope};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lockfile {
@@ -18,31 +18,37 @@ pub struct LockedArtifact {
     pub group: String,
     pub artifact: String,
     pub version: String,
+    #[serde(rename = "type")]
+    pub artifact_type: ArtifactType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<String>,
     pub scope: Scope,
     pub source: String,
     pub pom_path: PathBuf,
-    pub jar_path: PathBuf,
-    pub jar_sha256: Option<String>,
+    pub artifact_path: PathBuf,
+    pub artifact_sha256: Option<String>,
 }
 
 impl LockedArtifact {
     pub fn new(
-        coordinate: &Coordinate,
+        artifact: &ArtifactCoordinate,
         scope: Scope,
         source: &str,
         pom_path: PathBuf,
-        jar_path: PathBuf,
-        jar_sha256: Option<String>,
+        artifact_path: PathBuf,
+        artifact_sha256: Option<String>,
     ) -> Self {
         Self {
-            group: coordinate.group.clone(),
-            artifact: coordinate.artifact.clone(),
-            version: coordinate.version.clone(),
+            group: artifact.coordinate.group.clone(),
+            artifact: artifact.coordinate.artifact.clone(),
+            version: artifact.coordinate.version.clone(),
+            artifact_type: artifact.artifact_type,
+            classifier: artifact.classifier.clone(),
             scope,
             source: source.to_string(),
             pom_path,
-            jar_path,
-            jar_sha256,
+            artifact_path,
+            artifact_sha256,
         }
     }
 }
@@ -50,11 +56,20 @@ impl LockedArtifact {
 impl Lockfile {
     pub fn new(mut artifacts: Vec<LockedArtifact>) -> Self {
         artifacts.sort_by(|left, right| {
-            (&left.group, &left.artifact, &left.version).cmp(&(
-                &right.group,
-                &right.artifact,
-                &right.version,
-            ))
+            (
+                &left.group,
+                &left.artifact,
+                left.artifact_type,
+                &left.classifier,
+                &left.version,
+            )
+                .cmp(&(
+                    &right.group,
+                    &right.artifact,
+                    right.artifact_type,
+                    &right.classifier,
+                    &right.version,
+                ))
         });
 
         Self {
@@ -89,7 +104,7 @@ mod tests {
     #[test]
     fn serializes_stable_lockfile() {
         let lockfile = Lockfile::new(vec![LockedArtifact::new(
-            &Coordinate::new("b", "a", "1"),
+            &ArtifactCoordinate::jar(crate::maven::Coordinate::new("b", "a", "1")),
             Scope::Compile,
             "local",
             PathBuf::from("/m2/b/a/1/a-1.pom"),
@@ -100,6 +115,7 @@ mod tests {
         let serialized = toml::to_string_pretty(&lockfile).unwrap();
 
         assert!(serialized.contains("version = 1"));
-        assert!(serialized.contains("jar_sha256 = \"abc\""));
+        assert!(serialized.contains("type = \"jar\""));
+        assert!(serialized.contains("artifact_sha256 = \"abc\""));
     }
 }

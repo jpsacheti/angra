@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::Deserialize;
 
-use crate::maven::{Coordinate, Scope};
+use crate::maven::{ArtifactCoordinate, ArtifactType, Coordinate, Scope};
 
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
@@ -30,6 +30,10 @@ pub struct StructuredDependency {
     pub group: String,
     pub artifact: String,
     pub version: String,
+    #[serde(default, rename = "type")]
+    pub artifact_type: ArtifactType,
+    #[serde(default)]
+    pub classifier: Option<String>,
     #[serde(default)]
     pub scope: Scope,
     #[serde(default)]
@@ -39,7 +43,7 @@ pub struct StructuredDependency {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredDependency {
     pub alias: String,
-    pub coordinate: Coordinate,
+    pub artifact: ArtifactCoordinate,
     pub scope: Scope,
     pub exclusions: Vec<Coordinate>,
 }
@@ -54,8 +58,12 @@ impl Manifest {
         self.dependencies
             .iter()
             .map(|(alias, spec)| {
-                let (coordinate, scope, exclusions) = match spec {
-                    DependencySpec::Compact(raw) => (raw.parse()?, Scope::Compile, Vec::new()),
+                let (artifact, scope, exclusions) = match spec {
+                    DependencySpec::Compact(raw) => (
+                        ArtifactCoordinate::jar(raw.parse()?),
+                        Scope::Compile,
+                        Vec::new(),
+                    ),
                     DependencySpec::Structured(dep) => {
                         let exclusions = dep
                             .exclusions
@@ -64,7 +72,11 @@ impl Manifest {
                             .collect::<Result<Vec<_>, _>>()?;
 
                         (
-                            Coordinate::new(&dep.group, &dep.artifact, &dep.version),
+                            ArtifactCoordinate::new(
+                                Coordinate::new(&dep.group, &dep.artifact, &dep.version),
+                                dep.artifact_type,
+                                dep.classifier.clone(),
+                            ),
                             dep.scope,
                             exclusions,
                         )
@@ -73,7 +85,7 @@ impl Manifest {
 
                 Ok(DeclaredDependency {
                     alias: alias.clone(),
-                    coordinate,
+                    artifact,
                     scope,
                     exclusions,
                 })
@@ -102,7 +114,7 @@ mod tests {
             r#"
             [dependencies]
             guava = "com.google.guava:guava:33.0.0-jre"
-            jackson = { group = "com.fasterxml.jackson.core", artifact = "jackson-databind", version = "2.17.2", scope = "runtime", exclusions = ["com.foo:bar"] }
+            jackson = { group = "com.fasterxml.jackson.core", artifact = "jackson-databind", version = "2.17.2", scope = "runtime", exclusions = ["com.foo:bar"], type = "jar", classifier = "sources" }
             "#,
         )
         .unwrap();
@@ -114,6 +126,11 @@ mod tests {
         assert_eq!(dependencies[0].scope, Scope::Compile);
         assert_eq!(dependencies[1].alias, "jackson");
         assert_eq!(dependencies[1].scope, Scope::Runtime);
+        assert_eq!(dependencies[1].artifact.artifact_type, ArtifactType::Jar);
+        assert_eq!(
+            dependencies[1].artifact.classifier.as_deref(),
+            Some("sources")
+        );
         assert_eq!(dependencies[1].exclusions[0].group, "com.foo");
     }
 }

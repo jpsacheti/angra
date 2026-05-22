@@ -6,6 +6,33 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactType {
+    #[default]
+    Jar,
+    Pom,
+    War,
+}
+
+impl ArtifactType {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Jar => "jar",
+            Self::Pom => "pom",
+            Self::War => "war",
+        }
+    }
+}
+
+impl Display for ArtifactType {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.extension())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Coordinate {
     pub group: String,
@@ -35,6 +62,8 @@ impl Coordinate {
         ArtifactIdentity {
             group: self.group.clone(),
             artifact: self.artifact.clone(),
+            artifact_type: ArtifactType::Jar,
+            classifier: None,
         }
     }
 
@@ -59,8 +88,7 @@ impl Coordinate {
     }
 
     pub fn jar_path(&self, local_repo: &Path) -> PathBuf {
-        self.local_dir(local_repo)
-            .join(format!("{}-{}.jar", self.artifact, self.version))
+        ArtifactCoordinate::jar(self.clone()).artifact_path(local_repo)
     }
 
     pub fn central_pom_url(&self) -> String {
@@ -75,14 +103,91 @@ impl Coordinate {
     }
 
     pub fn central_jar_url(&self) -> String {
+        ArtifactCoordinate::jar(self.clone()).central_artifact_url()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ArtifactCoordinate {
+    pub coordinate: Coordinate,
+    #[serde(rename = "type")]
+    pub artifact_type: ArtifactType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<String>,
+}
+
+impl ArtifactCoordinate {
+    pub fn new(
+        coordinate: Coordinate,
+        artifact_type: ArtifactType,
+        classifier: Option<String>,
+    ) -> Self {
+        Self {
+            coordinate,
+            artifact_type,
+            classifier: classifier.filter(|value| !value.trim().is_empty()),
+        }
+    }
+
+    pub fn jar(coordinate: Coordinate) -> Self {
+        Self::new(coordinate, ArtifactType::Jar, None)
+    }
+
+    pub fn pom(coordinate: Coordinate) -> Self {
+        Self::new(coordinate, ArtifactType::Pom, None)
+    }
+
+    pub fn identity(&self) -> ArtifactIdentity {
+        ArtifactIdentity {
+            group: self.coordinate.group.clone(),
+            artifact: self.coordinate.artifact.clone(),
+            artifact_type: self.artifact_type,
+            classifier: self.classifier.clone(),
+        }
+    }
+
+    pub fn local_dir(&self, local_repo: &Path) -> PathBuf {
+        self.coordinate.local_dir(local_repo)
+    }
+
+    pub fn pom_path(&self, local_repo: &Path) -> PathBuf {
+        self.coordinate.pom_path(local_repo)
+    }
+
+    pub fn artifact_path(&self, local_repo: &Path) -> PathBuf {
+        if self.artifact_type == ArtifactType::Pom && self.classifier.is_none() {
+            return self.pom_path(local_repo);
+        }
+
+        self.local_dir(local_repo).join(format!(
+            "{}-{}.{}",
+            self.coordinate.artifact,
+            self.version_suffix(),
+            self.artifact_type.extension()
+        ))
+    }
+
+    pub fn central_artifact_url(&self) -> String {
+        if self.artifact_type == ArtifactType::Pom && self.classifier.is_none() {
+            return self.coordinate.central_pom_url();
+        }
+
         format!(
-            "https://repo1.maven.org/maven2/{}/{}/{}/{}-{}.jar",
-            self.group_path(),
-            self.artifact,
-            self.version,
-            self.artifact,
-            self.version
+            "https://repo1.maven.org/maven2/{}/{}/{}/{}-{}.{}",
+            self.coordinate.group_path(),
+            self.coordinate.artifact,
+            self.coordinate.version,
+            self.coordinate.artifact,
+            self.version_suffix(),
+            self.artifact_type.extension()
         )
+    }
+
+    fn version_suffix(&self) -> String {
+        match &self.classifier {
+            Some(classifier) => format!("{}-{classifier}", self.coordinate.version),
+            None => self.coordinate.version.clone(),
+        }
     }
 }
 
@@ -109,10 +214,37 @@ impl Display for Coordinate {
     }
 }
 
+impl Display for ArtifactCoordinate {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match &self.classifier {
+            Some(classifier) => write!(
+                formatter,
+                "{}:{}:{}:{}:{}",
+                self.coordinate.group,
+                self.coordinate.artifact,
+                self.artifact_type,
+                classifier,
+                self.coordinate.version
+            ),
+            None if self.artifact_type != ArtifactType::Jar => write!(
+                formatter,
+                "{}:{}:{}:{}",
+                self.coordinate.group,
+                self.coordinate.artifact,
+                self.artifact_type,
+                self.coordinate.version
+            ),
+            None => write!(formatter, "{}", self.coordinate),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ArtifactIdentity {
     pub group: String,
     pub artifact: String,
+    pub artifact_type: ArtifactType,
+    pub classifier: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +294,47 @@ mod tests {
         assert_eq!(
             coordinate.central_jar_url(),
             "https://repo1.maven.org/maven2/com/google/guava/guava/33.0.0-jre/guava-33.0.0-jre.jar"
+        );
+    }
+
+    #[test]
+    fn converts_artifact_coordinates_to_paths_and_urls() {
+        let local = Path::new("/tmp/m2");
+        let coordinate = Coordinate::new("com.example", "demo", "1.0.0");
+
+        assert_eq!(
+            ArtifactCoordinate::jar(coordinate.clone()).artifact_path(local),
+            Path::new("/tmp/m2/com/example/demo/1.0.0/demo-1.0.0.jar")
+        );
+        assert_eq!(
+            ArtifactCoordinate::new(coordinate.clone(), ArtifactType::War, None)
+                .artifact_path(local),
+            Path::new("/tmp/m2/com/example/demo/1.0.0/demo-1.0.0.war")
+        );
+        let classified = ArtifactCoordinate::new(
+            coordinate.clone(),
+            ArtifactType::Jar,
+            Some("linux-aarch64".to_string()),
+        );
+        assert_eq!(
+            classified.artifact_path(local),
+            Path::new("/tmp/m2/com/example/demo/1.0.0/demo-1.0.0-linux-aarch64.jar")
+        );
+        assert_eq!(
+            classified.central_artifact_url(),
+            "https://repo1.maven.org/maven2/com/example/demo/1.0.0/demo-1.0.0-linux-aarch64.jar"
+        );
+        assert_eq!(
+            ArtifactCoordinate::pom(coordinate.clone()).artifact_path(local),
+            Path::new("/tmp/m2/com/example/demo/1.0.0/demo-1.0.0.pom")
+        );
+        assert_eq!(
+            ArtifactCoordinate::pom(coordinate.clone()).central_artifact_url(),
+            "https://repo1.maven.org/maven2/com/example/demo/1.0.0/demo-1.0.0.pom"
+        );
+        assert_eq!(
+            ArtifactCoordinate::new(coordinate, ArtifactType::War, None).central_artifact_url(),
+            "https://repo1.maven.org/maven2/com/example/demo/1.0.0/demo-1.0.0.war"
         );
     }
 }
