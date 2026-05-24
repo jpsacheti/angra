@@ -259,3 +259,50 @@
 - Implementing Maven's full checksum policy matrix was rejected for this slice; settings.xml support has not landed yet.
 - Falling back to MD5 was rejected because Maven Central provides SHA-1 for this compatibility target and MD5 is a legacy fallback.
 - Verifying already-cached local files on every resolve was rejected to keep warm-cache resolution fast; this slice covers remote downloads.
+
+## 2026-05-22 - Commons Compress Baseline And Parallel Fetching
+
+### What was decided
+
+- Benchmark Commons Compress resolver behavior using an equivalent temporary Angra TOML and the real Commons Compress Maven POM.
+- Keep all benchmark manifests and local repositories under `/private/tmp`, leaving `benches/canary` untracked.
+- Add same-depth parallel artifact fetching to the resolver: dependencies at the same BFS depth fetch concurrently, then effective-POM parsing and graph expansion continue in deterministic queue order.
+
+### Why
+
+- Angra does not ingest source `pom.xml` files yet, so the benchmark isolates resolver performance rather than import behavior.
+- Same-depth batching gives useful network parallelism without changing nearest-wins conflict resolution semantics.
+- Keeping effective-POM expansion sequential after each fetch batch avoids racing parent/BOM descriptor writes while still overlapping independent artifact downloads.
+
+### Benchmark Notes
+
+- Commons Compress warm-cache baseline before parallel fetching: Angra release binary resolved the seven-artifact runtime graph in 30-31 ms over seven offline runs.
+- Maven `dependency:tree -Dscope=runtime` on the real Commons Compress POM, using a warm isolated temp Maven repo, took 1350-1599 ms over seven runs.
+- After parallel fetching, Angra warm-cache steady-state remained 30-32 ms after one first-run outlier; one cold network resolve into a fresh temp repo completed in 1222 ms.
+
+### What was rejected and why
+
+- Rewriting the resolver around async `reqwest` was rejected for this slice because the blocking resolver can gain first-order parallel fetch behavior with less churn.
+- Parallelizing effective-POM parent/BOM expansion was rejected for now because shared descriptor paths can race and the current bottleneck target is artifact download concurrency.
+- Committing Commons Compress as a fixture was rejected again; it remains a local benchmark/canary input.
+
+## 2026-05-24 - Project-Local Angra Repositories
+
+### What was decided
+
+- Add Angra-managed project repositories through a `[repositories]` table in `angra.toml`.
+- Keep Maven Central as the default repository when `[repositories]` is omitted.
+- Record the repository name as the lockfile `source` for artifacts downloaded through project-local repositories.
+- Keep global Angra config in the roadmap as a later follow-up, separate from Maven `settings.xml`.
+
+### Why
+
+- Angra needs a repository story it owns directly, instead of making users depend on Maven settings for ordinary non-Central resolution.
+- Project-local repository declarations are explicit, portable, and match Angra's low-ceremony TOML model.
+- A later global Angra config can reduce repetition across projects without importing Maven's settings/mirror/auth complexity too early.
+
+### What was rejected and why
+
+- Starting with Maven `settings.xml` was rejected as the primary path because it makes Angra's normal workflow depend on Maven-owned configuration.
+- Adding auth in this slice was rejected; unauthenticated repositories are enough to establish the model and keep the review boundary small.
+- Adding global config immediately was rejected in favor of project-local support first, because precedence rules and config discovery deserve their own slice.

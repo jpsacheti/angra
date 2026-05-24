@@ -6,6 +6,57 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub const MAVEN_CENTRAL_NAME: &str = "maven-central";
+pub const MAVEN_CENTRAL_URL: &str = "https://repo1.maven.org/maven2";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repository {
+    pub name: String,
+    pub url: String,
+}
+
+impl Repository {
+    pub fn new(name: &str, url: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            url: url.trim_end_matches('/').to_string(),
+        }
+    }
+
+    pub fn maven_central() -> Self {
+        Self::new(MAVEN_CENTRAL_NAME, MAVEN_CENTRAL_URL)
+    }
+
+    pub fn pom_url(&self, coordinate: &Coordinate) -> String {
+        format!(
+            "{}/{}/{}/{}/{}-{}.pom",
+            self.url,
+            coordinate.group_path(),
+            coordinate.artifact,
+            coordinate.version,
+            coordinate.artifact,
+            coordinate.version
+        )
+    }
+
+    pub fn artifact_url(&self, artifact: &ArtifactCoordinate) -> String {
+        if artifact.artifact_type == ArtifactType::Pom && artifact.classifier.is_none() {
+            return self.pom_url(&artifact.coordinate);
+        }
+
+        format!(
+            "{}/{}/{}/{}/{}-{}.{}",
+            self.url,
+            artifact.coordinate.group_path(),
+            artifact.coordinate.artifact,
+            artifact.coordinate.version,
+            artifact.coordinate.artifact,
+            artifact.version_suffix(),
+            artifact.artifact_type.extension()
+        )
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -92,14 +143,7 @@ impl Coordinate {
     }
 
     pub fn central_pom_url(&self) -> String {
-        format!(
-            "https://repo1.maven.org/maven2/{}/{}/{}/{}-{}.pom",
-            self.group_path(),
-            self.artifact,
-            self.version,
-            self.artifact,
-            self.version
-        )
+        Repository::maven_central().pom_url(self)
     }
 
     pub fn central_jar_url(&self) -> String {
@@ -168,19 +212,7 @@ impl ArtifactCoordinate {
     }
 
     pub fn central_artifact_url(&self) -> String {
-        if self.artifact_type == ArtifactType::Pom && self.classifier.is_none() {
-            return self.coordinate.central_pom_url();
-        }
-
-        format!(
-            "https://repo1.maven.org/maven2/{}/{}/{}/{}-{}.{}",
-            self.coordinate.group_path(),
-            self.coordinate.artifact,
-            self.coordinate.version,
-            self.coordinate.artifact,
-            self.version_suffix(),
-            self.artifact_type.extension()
-        )
+        Repository::maven_central().artifact_url(self)
     }
 
     fn version_suffix(&self) -> String {
@@ -280,6 +312,26 @@ mod tests {
         assert!("guava".parse::<Coordinate>().is_err());
         assert!("com.google.guava:guava".parse::<Coordinate>().is_err());
         assert!("com.google.guava:guava:".parse::<Coordinate>().is_err());
+    }
+
+    #[test]
+    fn builds_repository_urls() {
+        let repository = Repository::new("internal", "https://repo.example.com/maven/");
+        let coordinate = Coordinate::new("com.example", "demo", "1.0.0");
+        let classified = ArtifactCoordinate::new(
+            coordinate.clone(),
+            ArtifactType::Jar,
+            Some("linux-aarch64".to_string()),
+        );
+
+        assert_eq!(
+            repository.pom_url(&coordinate),
+            "https://repo.example.com/maven/com/example/demo/1.0.0/demo-1.0.0.pom"
+        );
+        assert_eq!(
+            repository.artifact_url(&classified),
+            "https://repo.example.com/maven/com/example/demo/1.0.0/demo-1.0.0-linux-aarch64.jar"
+        );
     }
 
     #[test]

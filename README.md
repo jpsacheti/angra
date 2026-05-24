@@ -30,6 +30,7 @@ Angra is very early. The current MVP focuses on dependency resolution.
 
 - Maven local repository layout under `~/.m2/repository`
 - Maven Central downloads
+- Project-local repository declarations in `angra.toml`
 - Deterministic TOML lockfile generation via `angra.lock`
 - Runtime dependency graph resolution for compile/runtime scopes
 - Current-POM and inherited parent property interpolation
@@ -38,6 +39,7 @@ Angra is very early. The current MVP focuses on dependency resolution.
 - `jar`, `pom`, and `war` dependency artifact types
 - Optional classifiers in structured dependencies and transitive POM dependencies
 - SHA-1 checksum verification for Maven Central downloads
+- Parallel same-depth artifact fetching during resolution
 - Optional dependency filtering
 - Exclusions
 - Basic nearest-wins conflict behavior
@@ -65,6 +67,9 @@ Create an `angra.toml`:
 group = "com.example"
 artifact = "demo"
 version = "0.1.0"
+
+[repositories]
+central = "https://repo1.maven.org/maven2"
 
 [dependencies]
 slf4j = "org.slf4j:slf4j-api:2.0.13"

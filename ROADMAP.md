@@ -43,8 +43,10 @@ In `master` today:
 - `<dependencyManagement>` honored in the transitive graph for version pinning. Initial support landed for managed versions, scopes, and exclusions.
 - BOM imports (`<scope>import</scope>` inside `<dependencyManagement>`). Initial support landed for imported BOM dependency management.
 - Classifier + packaging (`pom`, `jar`, `war`). Initial resolver support landed for structured TOML dependencies and transitive POM dependencies, including artifact-neutral lockfile fields.
-- Mirror + repository config from `~/.m2/settings.xml` (read-only — auth deferred).
-- Parallel artifact downloads and metadata fetches. Current `download()` in `src/resolver.rs` is sequential blocking; introduce a worker pool or switch to async `reqwest`.
+- Angra-managed project repositories via `[repositories]` in `angra.toml`. Initial unauthenticated repository support landed; Maven Central remains the default when omitted.
+- Global Angra config for reusable repositories, for example `~/.config/angra/config.toml`, planned after project-local repository support. This should be Angra-owned and not depend on Maven `settings.xml`.
+- Mirror + repository config from `~/.m2/settings.xml` (read-only — auth deferred) remains a Maven-compatibility follow-up, not the primary Angra config path.
+- Parallel artifact downloads and metadata fetches. Initial same-depth parallel artifact fetch landed; effective-POM expansion remains deterministic and sequential after each fetch batch.
 - Cache metadata aggressively without corrupting Maven compatibility: keep artifact files in Maven-compatible layout, but add an internal index for fast metadata/version lookup if profiling shows repeated filesystem scans are material.
 - Checksum verification against `.sha1` sibling files on Maven Central. Initial strict SHA-1 verification landed for remote downloads.
 - Failure attribution: when a coord fails, print the dependency path that pulled it in. Initial support landed for resolver failures with colorized CLI output.
