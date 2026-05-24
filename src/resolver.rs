@@ -11,10 +11,12 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    config::GlobalConfig,
     lockfile::{LockedArtifact, Lockfile, LockfileError},
     manifest::{DeclaredDependency, Manifest, ManifestError},
     maven::{ArtifactCoordinate, ArtifactIdentity, ArtifactType, Coordinate, Repository, Scope},
     pom::{EffectivePom, Pom, PomError},
+    settings::MavenSettings,
 };
 
 #[derive(Debug, Clone)]
@@ -48,8 +50,15 @@ pub fn resolve_project(options: ResolveOptions) -> Result<Lockfile, ResolveError
     let manifest_path = options.project_dir.join("angra.toml");
     let manifest = Manifest::read(&manifest_path)?;
     let dependencies = manifest.declared_dependencies()?;
-    let repositories = manifest.declared_repositories();
-    let local_repo = options.local_repo.unwrap_or(default_local_repo()?);
+    let global_config = GlobalConfig::load()?;
+    let settings = MavenSettings::load()?;
+    let repositories =
+        manifest.declared_repositories(&global_config.repositories(), &settings.repositories);
+    let local_repo = options
+        .local_repo
+        .or(settings.local_repository)
+        .map(Ok)
+        .unwrap_or_else(default_local_repo)?;
     let resolver = Resolver::new(local_repo, repositories, options.offline, options.refresh)?;
     let artifacts = resolver.resolve(dependencies)?;
 
@@ -495,13 +504,25 @@ fn sha256_file(path: &Path) -> Result<String, ResolveError> {
         hasher.update(&buffer[..read]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_bytes(&hasher.finalize()))
 }
 
 fn sha1_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex_bytes(&hasher.finalize())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+
+    output
 }
 
 fn checksum_path(path: &Path) -> PathBuf {
@@ -568,6 +589,10 @@ fn verify_sha1_checksum(
 pub enum ResolveError {
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Settings(#[from] crate::settings::SettingsError),
     #[error(transparent)]
     Lockfile(#[from] LockfileError),
     #[error("could not determine home directory for Maven local repository")]

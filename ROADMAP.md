@@ -4,7 +4,7 @@ Angra aims to be a fast, Maven-compatible Java project tool — `uv` ergonomics 
 
 This roadmap covers milestones **0.1 through 1.0**, ending at a usable replacement for everyday Maven workflows (resolve, add deps, build, test, run, package). The core architecture is a Rust driver that keeps normal CLI operations JVM-free, spawning Java only when compilation, tests, runtime execution, or future plugin compatibility require it. Publishing, built-in JDK management, IDE plugins, Maven plugin execution, and the long tail of Maven feature parity are deferred — see the [Deferred](#deferred) section. The decision log lives in [MEMORY.md](MEMORY.md).
 
-- **Last updated:** 2026-05-22
+- **Last updated:** 2026-05-24 (settings.xml read-only)
 - **Current milestone:** 0.2 (in progress — effective POM support started)
 
 ## Status legend
@@ -44,10 +44,10 @@ In `master` today:
 - BOM imports (`<scope>import</scope>` inside `<dependencyManagement>`). Initial support landed for imported BOM dependency management.
 - Classifier + packaging (`pom`, `jar`, `war`). Initial resolver support landed for structured TOML dependencies and transitive POM dependencies, including artifact-neutral lockfile fields.
 - Angra-managed project repositories via `[repositories]` in `angra.toml`. Initial unauthenticated repository support landed; Maven Central remains the default when omitted.
-- Global Angra config for reusable repositories, for example `~/.config/angra/config.toml`, planned after project-local repository support. This should be Angra-owned and not depend on Maven `settings.xml`.
-- Mirror + repository config from `~/.m2/settings.xml` (read-only — auth deferred) remains a Maven-compatibility follow-up, not the primary Angra config path.
+- Global Angra config for reusable repositories at `~/.config/angra/config.toml` on Unix-like systems, with platform config directory support on Windows. Initial repository support landed; project repos override globals by name while preserving declaration order.
+- Repository config from `~/.m2/settings.xml` (read-only — auth deferred): initial support landed for `<localRepository>` and active-profile `<repositories>`. Activation honors explicit `<activeProfiles>` and `<activeByDefault>`; property/OS/JDK/file-based activation is deferred. Mirrors remain a follow-up.
 - Parallel artifact downloads and metadata fetches. Initial same-depth parallel artifact fetch landed; effective-POM expansion remains deterministic and sequential after each fetch batch.
-- Cache metadata aggressively without corrupting Maven compatibility: keep artifact files in Maven-compatible layout, but add an internal index for fast metadata/version lookup if profiling shows repeated filesystem scans are material.
+- Cache metadata aggressively without corrupting Maven compatibility: keep artifact files in a Maven-compatible layout, but add an internal index for fast metadata/version lookup if profiling shows repeated filesystem scans are material.
 - Checksum verification against `.sha1` sibling files on Maven Central. Initial strict SHA-1 verification landed for remote downloads.
 - Failure attribution: when a coord fails, print the dependency path that pulled it in. Initial support landed for resolver failures with colorized CLI output.
 

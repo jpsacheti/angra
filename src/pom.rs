@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use quick_xml::{Reader, events::Event};
+use quick_xml::{Reader, escape::unescape, events::Event};
 
 use crate::maven::{ArtifactCoordinate, ArtifactIdentity, ArtifactType, Coordinate, Scope};
 
@@ -253,7 +253,8 @@ fn read_pom_properties(raw: &str) -> Result<BTreeMap<String, String>, PomError> 
                 );
             }
             Event::Text(text) if current_property.is_some() => {
-                current_value.push_str(&text.unescape()?);
+                let decoded = text.decode()?;
+                current_value.push_str(&unescape(&decoded)?);
             }
             Event::CData(text) if current_property.is_some() => {
                 current_value.push_str(&text.decode()?);
@@ -599,6 +600,8 @@ pub(crate) enum PomError {
     XmlRead(#[from] quick_xml::Error),
     #[error("failed to decode Maven POM XML: {0}")]
     XmlDecode(#[from] quick_xml::encoding::EncodingError),
+    #[error("failed to unescape Maven POM XML: {0}")]
+    XmlEscape(#[from] quick_xml::escape::EscapeError),
 }
 
 #[cfg(test)]

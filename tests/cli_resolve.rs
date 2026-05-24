@@ -75,9 +75,21 @@ fn write_remote_file(path: &std::path::Path, bytes: &[u8]) {
             "{}.sha1",
             path.extension().unwrap().to_string_lossy()
         )),
-        format!("{:x}", hasher.finalize()),
+        hex_bytes(&hasher.finalize()),
     )
     .unwrap();
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+
+    output
 }
 
 fn serve_directory(root: std::path::PathBuf) -> String {
@@ -331,6 +343,117 @@ fn resolve_failure_prints_colored_dependency_path() {
     assert!(stderr.contains("com.example:root:1.0.0"));
     assert!(stderr.contains("com.example:missing:1.0.0"));
     assert!(stderr.contains("->"));
+}
+
+#[test]
+fn resolve_uses_repository_from_maven_settings() {
+    let project = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    write_remote_artifact(remote.path(), "com.example", "demo", "1.0.0", "<project/>");
+    let repository_url = serve_directory(remote.path().to_path_buf());
+
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        demo = "com.example:demo:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let settings_dir = project.path().join(".m2");
+    fs::create_dir_all(&settings_dir).unwrap();
+    fs::write(
+        settings_dir.join("settings.xml"),
+        format!(
+            r#"<settings>
+              <profiles>
+                <profile>
+                  <id>default</id>
+                  <activation><activeByDefault>true</activeByDefault></activation>
+                  <repositories>
+                    <repository>
+                      <id>internal</id>
+                      <url>{repository_url}</url>
+                    </repository>
+                  </repositories>
+                </profile>
+              </profiles>
+            </settings>"#
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let output = Command::new(binary)
+        .args(["resolve", "--project-dir", project.path().to_str().unwrap()])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    assert!(lockfile.contains(r#"source = "internal""#));
+    assert!(lockfile.contains("demo-1.0.0.jar"));
+}
+
+#[test]
+fn resolve_uses_local_repository_from_maven_settings() {
+    let project = TempDir::new().unwrap();
+    let custom_repo = project.path().join("custom-m2");
+    write_artifact(&custom_repo, "com.example", "demo", "1.0.0", "<project/>");
+
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        demo = "com.example:demo:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let settings_dir = project.path().join(".m2");
+    fs::create_dir_all(&settings_dir).unwrap();
+    fs::write(
+        settings_dir.join("settings.xml"),
+        format!(
+            r#"<settings>
+              <localRepository>{}</localRepository>
+            </settings>"#,
+            custom_repo.display()
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let output = Command::new(binary)
+        .args([
+            "resolve",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    let custom_path = custom_repo.display().to_string();
+    assert!(
+        lockfile.contains(&custom_path),
+        "expected lockfile to reference custom local repo {custom_path}, got:\n{lockfile}"
+    );
 }
 
 #[test]

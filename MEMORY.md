@@ -306,3 +306,111 @@
 - Starting with Maven `settings.xml` was rejected as the primary path because it makes Angra's normal workflow depend on Maven-owned configuration.
 - Adding auth in this slice was rejected; unauthenticated repositories are enough to establish the model and keep the review boundary small.
 - Adding global config immediately was rejected in favor of project-local support first, because precedence rules and config discovery deserve their own slice.
+
+## 2026-05-24 - Global Angra Config
+
+### What was decided
+
+- Add `~/.config/angra/config.toml` as the global Angra config file on Unix-like systems, including macOS. Windows uses the platform config directory.
+- Global config supports a `[repositories]` table with the same name=URL format as `angra.toml`.
+- Repository order is preserved from declaration order. Project repos override global repos by name, and new project repos append after global repos. Maven Central is the default when neither defines any repos.
+- New `src/config.rs` module with `GlobalConfig` struct, `config_path()` helper, and `ConfigError` enum.
+- `Manifest::declared_repositories` now takes a `&[Repository]` of global repos and merges them.
+- `resolve_project` loads global config and passes merged repos to the resolver.
+- `ResolveError` gains a `Config` variant for global config read/parse failures.
+
+### Why
+
+- Corporate environments typically have a shared Nexus/Artifactory URL that every project needs. Repeating it in every `angra.toml` is ceremony.
+- Project repos overriding global repos by name lets developers point a repo at a staging URL locally without touching global config.
+- Keeping Maven Central as the default when both are empty preserves the zero-config experience for open-source projects.
+- A stable XDG-style path on macOS avoids surprising users with `~/Library/Application Support/...` when the documented Angra config path is `~/.config/angra/config.toml`.
+- Preserving repository declaration order keeps fallback behavior predictable for internal-first repository setups.
+
+### What was rejected and why
+
+- Silently appending Maven Central after configured global/project repos was rejected; configured repositories are explicit, and Maven Central remains the fallback only when no repositories are configured anywhere.
+- Sorting repositories by name was rejected because Maven repository order is semantically meaningful fallback behavior.
+- Adding auth or mirror config to global config was rejected; this slice is about reusable repository declarations only.
+- A separate `--config` CLI flag was rejected as premature; the standard path is enough for now.
+
+## 2026-05-24 - Session Summary
+
+### Worked on
+
+- Reviewed and fixed the global Angra config slice.
+- Preserved repository declaration order for global and project repositories.
+- Aligned documented and implemented global config path behavior.
+- Re-ran resolver verification and benchmarks.
+
+### Completed
+
+- Replaced repository tables with ordered `IndexMap` parsing and enabled TOML preserve-order support.
+- Global config now uses `~/.config/angra/config.toml` on Unix-like systems, including macOS. Windows keeps the platform config directory.
+- Added tests for global repository order, project repository order, project-over-global override behavior, and Unix config path shape.
+- Updated `ROADMAP.md` and local `tasks.md`.
+- Verification passed: `cargo fmt --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `git diff --check`.
+- Release benchmark harness passed outside the sandbox: direct 3 ms, transitive 12 ms, conflict 8 ms for Angra; Maven 1723-1979 ms; Gradle 2231-3408 ms.
+- Commons Compress canary warm-cache timing stayed near baseline: Angra offline 20-40 ms over seven runs; Maven runtime dependency tree 1.55-1.57 s over seven runs.
+
+### In progress
+
+- Read-only Maven `settings.xml` support remains next for resolver compatibility.
+- Mirror selection, repository policy, snapshots, version ranges, profiles, and local parent `<relativePath>` behavior remain unresolved 0.2 decisions.
+
+### Decisions made
+
+- Repository declaration order is resolver behavior, not presentation detail.
+- Angra's documented global config path should be stable and Angra-owned, not inherited from macOS application-support conventions.
+
+### Next session priorities
+
+- Implement read-only `~/.m2/settings.xml` support for repositories and mirrors.
+- Keep auth deferred, but add explicit diagnostics for auth-required repositories.
+- Re-run the Commons Compress canary after settings/mirror support lands.
+
+## 2026-05-24 - Dependency Upgrade Compatibility
+
+### What was decided
+
+- Use `reqwest` 0.13's `rustls` feature instead of the removed `rustls-tls` feature.
+- Normalize the `toml` dependency version to `1.1.2`; Cargo ignores semver build metadata such as `+spec-1.1.0` in version requirements.
+- Adapt `quick-xml` 0.40 text handling by decoding text and then unescaping XML entities explicitly.
+- Adapt `sha1`/`sha2` 0.11 digest output by hex-encoding finalized digest bytes locally.
+
+### Why
+
+- These changes preserve the existing resolver behavior while making the dependency upgrade compile and test cleanly.
+- `reqwest` 0.13's `rustls-no-provider` feature was not used because it would require Angra to manage Rustls crypto-provider setup at runtime.
+
+### What was rejected and why
+
+- Reverting the dependency updates was rejected because the upgraded APIs required only narrow compatibility fixes.
+- Adding a new hex-formatting dependency was rejected because local lowercase hex encoding is tiny and keeps overhead minimal.
+
+## 2026-05-24 - Read-Only `~/.m2/settings.xml` Support
+
+### What was decided
+
+- Add `src/settings.rs` with `MavenSettings::load()` reading `~/.m2/settings.xml`, returning an empty struct when the file is absent.
+- Parse only `<localRepository>` and `<repositories>` from active profiles. Profile activation honors `<activeProfiles><activeProfile>id</activeProfile></activeProfiles>` and `<activation><activeByDefault>true</activeByDefault></activation>`; all other activation modes (property, OS, JDK, file) are deferred.
+- Skip `<servers>`, `<mirrors>`, and `<proxies>` entirely in this slice. Mirrors land in the next slice; auth remains deferred.
+- Precedence for the merged repository list, from highest to lowest by name: project (`angra.toml`) > global (`~/.config/angra/config.toml`) > settings (`~/.m2/settings.xml`). Order in the resolver fallback chain: globals first (declaration order), then unmatched project repos, then unmatched settings repos as a compatibility tail. Maven Central remains the fallback only when no repos are declared anywhere.
+- Precedence for the local repository: `ResolveOptions.local_repo` > settings `<localRepository>` > `~/.m2/repository`.
+- `Manifest::declared_repositories` signature extends to `(&[Repository] global, &[Repository] settings)`. `ResolveError` gains a `Settings` variant wrapping `SettingsError`.
+- Angra ignores Maven's global settings file at `${maven.home}/conf/settings.xml`; Angra does not require a Maven install.
+
+### Why
+
+- The roadmap explicitly framed settings.xml as a Maven-compatibility layer, not Angra's primary config path. Treating settings repos as a low-precedence tail keeps Angra-native configuration authoritative while still giving users the corporate Nexus they likely already have configured for Maven.
+- Active-profile filtering is a hard requirement — Maven's `<profiles>` are dormant unless explicitly activated, so unconditionally importing every repository would diverge from Maven behavior.
+- Limiting activation to listed + `activeByDefault` keeps the slice small, matches the most common settings.xml shapes, and avoids dragging in property/OS/JDK probes that belong with profile activation as a broader concept.
+- Lowest-precedence-by-name for settings repos guarantees that an existing Angra project repo or global config repo can never be silently shadowed by a stale entry someone has had in their `~/.m2/settings.xml` since their Maven 2 days.
+
+### What was rejected and why
+
+- Parsing `<servers>` and threading auth into downloads was rejected; auth stays deferred and the slice keeps a clean review boundary.
+- Parsing `<mirrors>` in this slice was rejected because tasks.md splits mirror selection into the next slice, and CLAUDE.md prohibits designing for hypothetical future requirements.
+- Making settings repos override project or global repos by name was rejected; legacy Maven config should never silently shadow explicit Angra-native intent.
+- Including settings repos at the front of the fallback chain was rejected for the same reason; explicit Angra-native repos are tried first.
+- Reading the global `${maven.home}/conf/settings.xml` was rejected because Angra does not require a Maven install and we don't want resolver behavior to depend on whether Maven is on `PATH`.
