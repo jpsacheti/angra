@@ -52,8 +52,9 @@ pub fn resolve_project(options: ResolveOptions) -> Result<Lockfile, ResolveError
     let dependencies = manifest.declared_dependencies()?;
     let global_config = GlobalConfig::load()?;
     let settings = MavenSettings::load()?;
-    let repositories =
+    let mut repositories =
         manifest.declared_repositories(&global_config.repositories(), &settings.repositories);
+    settings.apply_mirrors(&mut repositories);
     let local_repo = options
         .local_repo
         .or(settings.local_repository)

@@ -12,10 +12,38 @@ use crate::maven::Repository;
 pub struct MavenSettings {
     pub local_repository: Option<PathBuf>,
     pub repositories: Vec<Repository>,
+    pub mirrors: Vec<Mirror>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mirror {
+    pub id: String,
+    pub url: String,
+    pub mirror_of: String,
+}
+
+impl Mirror {
+    pub fn matches(&self, repository_name: &str) -> bool {
+        let mut positive_match = false;
+        let mut negated = false;
+
+        for token in self.mirror_of.split(',') {
+            let token = token.trim();
+            if let Some(excluded) = token.strip_prefix('!') {
+                let excluded = excluded.trim();
+                if excluded == "*" || excluded == repository_name {
+                    negated = true;
+                }
+            } else if token == "*" || token == repository_name {
+                positive_match = true;
+            }
+        }
+
+        positive_match && !negated
+    }
 }
 
 impl MavenSettings {
-    /// Load `~/.m2/settings.xml`. Returns a default (empty) settings if the file does not exist.
     pub fn load() -> Result<Self, SettingsError> {
         let path = settings_path();
         Self::load_or_default(&path)
@@ -72,6 +100,31 @@ impl MavenSettings {
             }
         }
 
+        let mut mirrors = Vec::new();
+        let mut mirror_seen = HashSet::new();
+        for mirror in &parsed.mirrors.mirror {
+            let Some(id) = mirror.id.as_deref().map(str::trim) else {
+                continue;
+            };
+            let Some(url) = mirror.url.as_deref().map(str::trim) else {
+                continue;
+            };
+            let Some(mirror_of) = mirror.mirror_of.as_deref().map(str::trim) else {
+                continue;
+            };
+            if id.is_empty() || url.is_empty() || mirror_of.is_empty() {
+                continue;
+            }
+            if !mirror_seen.insert(id.to_string()) {
+                continue;
+            }
+            mirrors.push(Mirror {
+                id: id.to_string(),
+                url: url.trim_end_matches('/').to_string(),
+                mirror_of: mirror_of.to_string(),
+            });
+        }
+
         let local_repository = parsed
             .local_repository
             .as_deref()
@@ -82,14 +135,27 @@ impl MavenSettings {
         Ok(Self {
             local_repository,
             repositories,
+            mirrors,
         })
+    }
+
+    pub fn apply_mirrors(&self, repositories: &mut Vec<Repository>) {
+        if self.mirrors.is_empty() {
+            return;
+        }
+
+        for repository in repositories.iter_mut() {
+            if let Some(mirror) = self.mirrors.iter().find(|m| m.matches(&repository.name)) {
+                repository.name = mirror.id.clone();
+                repository.url = mirror.url.clone();
+            }
+        }
+
+        let mut seen = HashSet::new();
+        repositories.retain(|repository| seen.insert(repository.name.clone()));
     }
 }
 
-/// Returns the user-level Maven settings path: `~/.m2/settings.xml`.
-///
-/// Maven also reads a global settings file at `${maven.home}/conf/settings.xml`,
-/// which Angra intentionally ignores: Angra does not require a Maven install.
 pub fn settings_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -113,6 +179,8 @@ struct RawSettings {
     active_profiles: ActiveProfiles,
     #[serde(default)]
     profiles: Profiles,
+    #[serde(default)]
+    mirrors: Mirrors,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -154,6 +222,20 @@ struct ProfileRepositories {
 struct ProfileRepository {
     id: Option<String>,
     url: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Mirrors {
+    #[serde(default)]
+    mirror: Vec<RawMirror>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawMirror {
+    id: Option<String>,
+    url: Option<String>,
+    mirror_of: Option<String>,
 }
 
 #[cfg(test)]
@@ -349,5 +431,288 @@ mod tests {
     #[test]
     fn settings_path_lives_under_home_m2() {
         assert!(settings_path().ends_with(Path::new(".m2").join("settings.xml")));
+    }
+
+    #[test]
+    fn parses_mirrors_from_settings() {
+        let settings = MavenSettings::parse(
+            r#"
+            <settings>
+              <mirrors>
+                <mirror>
+                  <id>my-mirror</id>
+                  <url>https://mirror.example.com/maven/</url>
+                  <mirrorOf>central</mirrorOf>
+                </mirror>
+              </mirrors>
+            </settings>
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.mirrors.len(), 1);
+        assert_eq!(settings.mirrors[0].id, "my-mirror");
+        assert_eq!(settings.mirrors[0].url, "https://mirror.example.com/maven");
+        assert_eq!(settings.mirrors[0].mirror_of, "central");
+    }
+
+    #[test]
+    fn skips_mirror_with_missing_fields() {
+        let settings = MavenSettings::parse(
+            r#"
+            <settings>
+              <mirrors>
+                <mirror>
+                  <url>https://mirror.example.com/maven/</url>
+                  <mirrorOf>central</mirrorOf>
+                </mirror>
+                <mirror>
+                  <id>no-url</id>
+                  <mirrorOf>central</mirrorOf>
+                </mirror>
+                <mirror>
+                  <id>no-mirror-of</id>
+                  <url>https://mirror.example.com/maven/</url>
+                </mirror>
+                <mirror>
+                  <id>ok</id>
+                  <url>https://ok.example.com/maven/</url>
+                  <mirrorOf>*</mirrorOf>
+                </mirror>
+              </mirrors>
+            </settings>
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.mirrors.len(), 1);
+        assert_eq!(settings.mirrors[0].id, "ok");
+    }
+
+    #[test]
+    fn deduplicates_mirrors_by_id() {
+        let settings = MavenSettings::parse(
+            r#"
+            <settings>
+              <mirrors>
+                <mirror>
+                  <id>shared</id>
+                  <url>https://first.example.com/maven/</url>
+                  <mirrorOf>central</mirrorOf>
+                </mirror>
+                <mirror>
+                  <id>shared</id>
+                  <url>https://second.example.com/maven/</url>
+                  <mirrorOf>*</mirrorOf>
+                </mirror>
+              </mirrors>
+            </settings>
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.mirrors.len(), 1);
+        assert_eq!(settings.mirrors[0].url, "https://first.example.com/maven");
+    }
+
+    #[test]
+    fn mirror_matches_specific_repo_name() {
+        let mirror = Mirror {
+            id: "m".to_string(),
+            url: "https://mirror.example.com".to_string(),
+            mirror_of: "central".to_string(),
+        };
+
+        assert!(mirror.matches("central"));
+        assert!(!mirror.matches("internal"));
+    }
+
+    #[test]
+    fn mirror_matches_wildcard() {
+        let mirror = Mirror {
+            id: "m".to_string(),
+            url: "https://mirror.example.com".to_string(),
+            mirror_of: "*".to_string(),
+        };
+
+        assert!(mirror.matches("central"));
+        assert!(mirror.matches("internal"));
+        assert!(mirror.matches("anything"));
+    }
+
+    #[test]
+    fn mirror_matches_comma_separated_names() {
+        let mirror = Mirror {
+            id: "m".to_string(),
+            url: "https://mirror.example.com".to_string(),
+            mirror_of: "central,internal".to_string(),
+        };
+
+        assert!(mirror.matches("central"));
+        assert!(mirror.matches("internal"));
+        assert!(!mirror.matches("other"));
+    }
+
+    #[test]
+    fn mirror_negation_excludes_repo() {
+        let mirror = Mirror {
+            id: "m".to_string(),
+            url: "https://mirror.example.com".to_string(),
+            mirror_of: "*,!internal".to_string(),
+        };
+
+        assert!(mirror.matches("central"));
+        assert!(!mirror.matches("internal"));
+    }
+
+    #[test]
+    fn mirror_negation_only_excludes_when_positive_matches() {
+        let mirror = Mirror {
+            id: "m".to_string(),
+            url: "https://mirror.example.com".to_string(),
+            mirror_of: "!internal".to_string(),
+        };
+
+        assert!(!mirror.matches("central"));
+        assert!(!mirror.matches("internal"));
+    }
+
+    #[test]
+    fn apply_mirrors_rewrites_matching_repository_url() {
+        let settings = MavenSettings::parse(
+            r#"
+            <settings>
+              <mirrors>
+                <mirror>
+                  <id>my-mirror</id>
+                  <url>https://mirror.example.com/maven/</url>
+                  <mirrorOf>central</mirrorOf>
+                </mirror>
+              </mirrors>
+            </settings>
+            "#,
+        )
+        .unwrap();
+
+        let mut repos = vec![
+            Repository::new("central", "https://repo1.maven.org/maven2/"),
+            Repository::new("internal", "https://nexus.example.com/maven/"),
+        ];
+
+        settings.apply_mirrors(&mut repos);
+
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].name, "my-mirror");
+        assert_eq!(repos[0].url, "https://mirror.example.com/maven");
+        assert_eq!(repos[1].name, "internal");
+        assert_eq!(repos[1].url, "https://nexus.example.com/maven");
+    }
+
+    #[test]
+    fn apply_mirrors_wildcard_deduplicates_to_single_repo() {
+        let settings = MavenSettings::parse(
+            r#"
+            <settings>
+              <mirrors>
+                <mirror>
+                  <id>my-mirror</id>
+                  <url>https://mirror.example.com/maven/</url>
+                  <mirrorOf>*</mirrorOf>
+                </mirror>
+              </mirrors>
+            </settings>
+            "#,
+        )
+        .unwrap();
+
+        let mut repos = vec![
+            Repository::new("central", "https://repo1.maven.org/maven2/"),
+            Repository::new("internal", "https://nexus.example.com/maven/"),
+            Repository::new("other", "https://other.example.com/maven/"),
+        ];
+
+        settings.apply_mirrors(&mut repos);
+
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, "my-mirror");
+        assert_eq!(repos[0].url, "https://mirror.example.com/maven");
+    }
+
+    #[test]
+    fn apply_mirrors_negation_preserves_excluded_repo() {
+        let settings = MavenSettings::parse(
+            r#"
+            <settings>
+              <mirrors>
+                <mirror>
+                  <id>my-mirror</id>
+                  <url>https://mirror.example.com/maven/</url>
+                  <mirrorOf>*,!internal</mirrorOf>
+                </mirror>
+              </mirrors>
+            </settings>
+            "#,
+        )
+        .unwrap();
+
+        let mut repos = vec![
+            Repository::new("central", "https://repo1.maven.org/maven2/"),
+            Repository::new("internal", "https://nexus.example.com/maven/"),
+        ];
+
+        settings.apply_mirrors(&mut repos);
+
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].name, "my-mirror");
+        assert_eq!(repos[0].url, "https://mirror.example.com/maven");
+        assert_eq!(repos[1].name, "internal");
+        assert_eq!(repos[1].url, "https://nexus.example.com/maven");
+    }
+
+    #[test]
+    fn apply_mirrors_first_match_wins() {
+        let settings = MavenSettings::parse(
+            r#"
+            <settings>
+              <mirrors>
+                <mirror>
+                  <id>first-mirror</id>
+                  <url>https://first.example.com/maven/</url>
+                  <mirrorOf>central</mirrorOf>
+                </mirror>
+                <mirror>
+                  <id>second-mirror</id>
+                  <url>https://second.example.com/maven/</url>
+                  <mirrorOf>*</mirrorOf>
+                </mirror>
+              </mirrors>
+            </settings>
+            "#,
+        )
+        .unwrap();
+
+        let mut repos = vec![
+            Repository::new("central", "https://repo1.maven.org/maven2/"),
+            Repository::new("other", "https://other.example.com/maven/"),
+        ];
+
+        settings.apply_mirrors(&mut repos);
+
+        let central = repos.iter().find(|r| r.name == "first-mirror").unwrap();
+        assert_eq!(central.url, "https://first.example.com/maven");
+        let other = repos.iter().find(|r| r.name == "second-mirror").unwrap();
+        assert_eq!(other.url, "https://second.example.com/maven");
+    }
+
+    #[test]
+    fn apply_mirrors_noop_when_no_mirrors() {
+        let settings = MavenSettings::default();
+        let mut repos = vec![Repository::new(
+            "central",
+            "https://repo1.maven.org/maven2/",
+        )];
+        settings.apply_mirrors(&mut repos);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, "central");
     }
 }
