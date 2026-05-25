@@ -169,3 +169,23 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - A full dependency graph abstraction was rejected for current failure attribution; queue path tracking is enough.
 - A manual bit-flipping hex-encoding function was initially implemented but subsequently rejected in favor of the highly optimized, SIMD-accelerated 'faster-hex' library to prioritize maximum runtime speed and code safety over compile-time savings.
 - Parsing auth or mirrors in the original settings repository slice was rejected to keep review boundaries small; mirrors have since landed, auth remains deferred.
+
+## Session Summary - 2026-05-24
+
+- **Worked on:** Repository policy basics (releases/snapshots checking in resolver and POM/settings parsing), dynamic settings-based mirrors matching and application, deferred authentication diagnostic handling, and hex-encoding optimization.
+- **Completed:**
+  - `RepositoryPolicy` support with case-sensitive snapshot detection.
+  - Dynamic settings mirrors matching (`*`, negation, comma-separated), deduplication, and repository rewrite.
+  - `AuthenticationRequired` custom error diagnostic providing actionable steps on 401/403 intercept.
+  - Integrated `faster-hex` library for SIMD-accelerated checksum hex serialization.
+  - Created the `feature/repo-policies-and-mirror` branch and committed all work with 77 unit tests, 7 integration tests, formatting, and clippy passing cleanly.
+- **In progress:** None.
+- **Decisions made:**
+  - Adopted `faster-hex` dependency to prioritize runtime performance over compile time.
+  - Selected lexically scoped repositories (Approach A) to prevent repository leakage across dependencies.
+  - Rejected setting up local git pre-commit hooks for now, leaving validation checks for a future comprehensive CI pipeline.
+- **Next session priorities:**
+  - Implement full SNAPSHOT timestamp/build-number resolution.
+  - Add version ranges support.
+  - Implement full Maven profile activation logic (property, OS, JDK, and file-based activations).
+  - Re-run the Commons Compress canary to verify resolution performance with settings and mirrors applied.
