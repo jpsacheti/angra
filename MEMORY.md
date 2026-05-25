@@ -1,74 +1,152 @@
 # MEMORY.md
 
-## 2026-05-20 - Project Guidance
+Durable project memory for Angra. Keep this file compact: record decisions that should constrain future work, current unresolved boundaries, and next priorities. Do not use it as a changelog; git history and `ROADMAP.md` carry implementation detail.
 
-### What was decided
+## Product Direction
 
-- Maintain `AGENTS.md` as the project instruction file for agent behavior.
-- Maintain `MEMORY.md` as the durable project memory.
-- Use the project context that `angra` aims to be a Java equivalent of `uv`, with full Maven compatibility, TOML-based project management, minimal overhead, and developer joy as a core design constraint.
+- Angra aims to be the Java equivalent of `uv`: fast, low-ceremony, Maven-compatible, and pleasant for Java developers and DevOps engineers.
+- Angra uses TOML as its native project management format while staying compatible with Maven artifacts and `pom.xml` behavior.
+- Maven compatibility and low overhead are foundational constraints. Avoid changes that make Angra slower than Maven or more ceremonious than Maven/Gradle.
+- The normal resolver and CLI path should remain JVM-free. Start Java only for compile, test, run, package, or future plugin compatibility.
+- Toolchains are delegated to `mise` / SDKMan through the 1.0 roadmap. Built-in JDK download/management is out of scope for now.
+- Apache-2.0 is the project license.
 
-### Why
+## Roadmap Shape
 
-- The project is brand new, so establishing behavior, decision logging, and product direction early keeps future work consistent.
-- Maven compatibility and low overhead are foundational constraints, not incidental preferences.
+- Keep `ROADMAP.md` as the checked-in roadmap and keep it in sync when milestone scope changes.
+- The 0.1 to 1.0 path ends at build and run:
+  - 0.1 resolver MVP: shipped.
+  - 0.2 resolver realism: in progress.
+  - 0.3 manifest lifecycle: planned.
+  - 0.4 compile and test: planned.
+  - 0.5 package and run: planned.
+  - 1.0 hardening: planned.
+- Use versioned milestones with plain text status tags such as `[shipped]`, `[in progress]`, `[planned]`, and `[deferred]`.
+- Each milestone should exit with tests and clippy green, a fixture project working end to end, benchmark harness updates where relevant, and a memory entry for durable decisions.
+- Publishing, IDE plugins, built-in JDK management, and arbitrary Maven plugin execution are deferred beyond the 1.0 inner-loop target unless explicitly reprioritized.
 
-### What was rejected and why
+## Resolver Baseline
 
-- Proceeding without durable memory was rejected because future sessions need to preserve decisions and avoid contradicting earlier project direction.
-- Treating TOML support as separate from Maven compatibility was rejected because the intended direction is TOML ergonomics while remaining compatible with `pom.xml`.
+- The first useful slice is `angra resolve`.
+- `angra resolve` reads `angra.toml`, resolves Maven-compatible dependencies from the local Maven repository and configured remote repositories, caches artifacts in Maven local repository layout, and writes deterministic TOML `angra.lock`.
+- Supported dependency declaration forms:
+  - Compact string: `group:artifact:version`.
+  - Structured dependency with `group`, `artifact`, `version`, `scope`, `exclusions`, and richer artifact identity fields where supported.
+- Do not shell out to Maven for Angra resolution. That weakens the product premise and hides performance characteristics.
+- Starting with full `pom.xml` ingestion was intentionally rejected. The first compatibility target is Maven artifact/POM resolution behavior; source project POM import can come later.
+- Benchmarks compare Angra with Maven and Gradle using `mise` with dynamic latest Maven/Gradle versions. Do not pin those tool versions in repo config unless the benchmark design changes.
+- Benchmark output should be human-readable first, followed by raw JSON details.
 
-## 2026-05-21 - MVP Resolver And Benchmark Direction
+## Maven Model Decisions
 
-### What was decided
+- POM parsing, property interpolation, dependency management modeling, and effective-model merging live in `src/pom.rs`.
+- Resolver graph traversal stays in `src/resolver.rs`; POM fetching remains resolver-owned.
+- Effective POM support includes recursive repository-resolved parent POMs, inherited properties, dependency management, managed scopes/exclusions, and BOM imports via `<type>pom</type>` plus `<scope>import</scope>`.
+- Current property interpolation supports Maven-style `${project.groupId}`, `${project.artifactId}`, `${project.version}`, matching `pom.*` aliases, user-defined `<properties>`, recursive property values, and explicit errors for unresolved or cyclic properties.
+- Managed scope can make a dependency non-runtime, so runtime eligibility must be checked after dependency management is applied.
+- Parent and BOM POMs are POM-only artifacts; resolver has a separate POM path and must not require jars for every coordinate.
+- Fully modeling Maven local parent `<relativePath>` lookup is deferred. Repository-resolved parent POMs are enough for the current Maven Central compatibility slice.
+- Profile behavior remains incomplete. Settings profile activation currently supports listed active profiles and `activeByDefault`; property, OS, JDK, and file activation remain deferred.
 
-- Implement the first MVP around `angra resolve`.
-- Read `angra.toml`, resolve Maven-compatible dependencies from `~/.m2/repository` and Maven Central, cache artifacts in Maven local repository layout, and write deterministic TOML `angra.lock`.
-- Support both compact dependency syntax (`group:artifact:version`) and structured dependency syntax (`group`, `artifact`, `version`, `scope`, `exclusions`).
-- Add benchmark infrastructure from the start, comparing Angra with Maven and Gradle for comparable dependency-resolution workloads.
-- Use `mise` to run Maven and Gradle benchmarks with dynamic latest tool versions.
+## Artifact Identity And Lockfile
 
-### Why
+- Maven artifact identity is richer than plain GAV. Angra models `ArtifactCoordinate`, supported artifact types (`jar`, `pom`, `war`), and optional classifiers.
+- `Coordinate` remains the plain Maven GAV descriptor used for normal POM reads.
+- Classified artifacts and `war` artifacts resolve from extension-aware paths while still reading the normal unclassified POM descriptor.
+- Unclassified `pom` dependencies are descriptor-only artifacts: resolve/read the POM and do not require a jar or war file.
+- Unknown Maven artifact types fail explicitly until Angra models Maven artifact handlers. Do not guess extensions.
+- Compact TOML strings stay `group:artifact:version`; richer identity belongs in structured dependencies.
+- Lockfile artifact fields are artifact-neutral: use `artifact_path`, `artifact_sha256`, `type`, and optional `classifier`. Avoid jar-specific naming.
+- Dependency paths are diagnostics only. Do not persist resolver provenance in `angra.lock`.
 
-- Dependency resolution is the smallest useful slice that proves Angra's core value: Maven compatibility with less ceremony.
-- Benchmarks need to exist alongside features so speed remains a product constraint, not a late-stage cleanup item.
-- Dynamic `mise` versions make the benchmark workflow easy to keep current for local comparisons.
+## Repository And Config Decisions
 
-### What was rejected and why
+- Project-local repositories are declared in `[repositories]` inside `angra.toml`.
+- Global Angra config lives at `~/.config/angra/config.toml` on Unix-like systems, including macOS. Windows uses the platform config directory.
+- Global config supports `[repositories]` using the same name equals URL shape as project TOML.
+- Repository declaration order is resolver behavior, not presentation detail. Preserve order from TOML declaration.
+- Repository precedence by name: project repos override global repos, and global repos override settings repos.
+- Resolver fallback order: global repositories first in declaration order, then unmatched project repositories, then unmatched Maven settings repositories. Maven Central is used only when no repositories are configured anywhere.
+- Do not silently append Maven Central after configured repositories. Configured repositories are explicit.
+- Do not sort repositories by name; order is semantically meaningful fallback behavior.
+- A separate `--config` flag is premature.
 
-- Shelling out to Maven for Angra resolution was rejected because it weakens the product premise and hides performance characteristics.
-- Starting with `pom.xml` ingestion was rejected because the first compatibility target is Maven artifact/POM resolution behavior.
-- Pinning Maven and Gradle versions in repo config was rejected in favor of dynamic latest versions through `mise`.
+## Maven Settings Decisions
 
-## 2026-05-21 - Session Summary
+- `src/settings.rs` owns read-only Maven settings support.
+- Read only user settings at `~/.m2/settings.xml`. Do not read Maven global settings from `${maven.home}/conf/settings.xml`; Angra must not require a Maven install.
+- Settings support currently covers `<localRepository>`, active-profile `<repositories>`, and `<mirrors>`.
+- Local repository precedence: explicit `ResolveOptions.local_repo` > settings `<localRepository>` > `~/.m2/repository`.
+- Settings repositories are compatibility tail entries. Legacy Maven config must not silently shadow explicit Angra-native project or global configuration.
+- Mirrors from settings are applied after project/global/settings repository merging and before creating the resolver.
+- Mirror matching supports `*`, comma-separated repository IDs, and `!` negation. First matching mirror wins.
+- Mirror application rewrites the matched repository name and URL, then deduplicates by name so wildcard mirrors do not cause redundant requests.
+- The resolver should remain mirror-unaware; settings concepts are applied before the repository list reaches resolver fetching.
+- `<servers>`, `<proxies>`, and auth are deferred.
+- Maven `external:*` mirror semantics and broader glob/regex `mirrorOf` patterns are deferred; current repositories are HTTP(S)-oriented.
 
-### Worked on
+## Download Integrity
 
-- Bootstrapped Angra as a Rust CLI project for Maven-compatible Java dependency resolution.
-- Added project instructions, durable memory, documentation, contribution guidance, and Apache-2.0 licensing.
+- Remote Maven downloads are verified against sibling `.sha1` files before writing artifacts or POMs into the local repository.
+- Verified `.sha1` files are stored next to local files using Maven's `file.ext.sha1` layout.
+- Parse common Maven SHA-1 checksum formats: bare hex with optional filename, uppercase hex, and `SHA1 (...) = hex`.
+- Checksum mismatch or malformed checksum content is a resolver error.
+- Do not fall back to MD5.
+- Do not reverify already-cached local files on every resolve; warm-cache speed matters. This can be revisited when Maven checksum policies are modeled.
+- Full Maven checksum policy behavior is deferred until settings policy support exists.
 
-### Completed
+## Resolver Diagnostics And Performance
 
-- Implemented `angra resolve`.
-- Implemented `angra.toml` dependency parsing for compact and structured declarations.
-- Implemented Maven coordinate handling, local repository layout, Maven Central downloads, runtime graph resolution, optional dependency filtering, exclusions, basic nearest-wins conflict behavior, and deterministic TOML `angra.lock` generation.
-- Added benchmark fixtures and an `angra-bench` runner comparing Angra with Maven and Gradle through `mise`.
-- Added benchmark summary output showing how many times faster Angra is than Maven and Gradle.
-- Added `README.md`, `CONTRIBUTING.md`, and `LICENSE`.
+- Track dependency provenance in the resolver queue as a vector of `ArtifactCoordinate` values.
+- Wrap artifact fetch, effective-POM, and dependency parse failures with the active dependency path.
+- CLI resolver failures render a compact, colorized `root -> child -> failing-artifact` path.
+- Avoid adding a color dependency for now; simple ANSI styling is enough.
+- Same-depth resolver fetching may run concurrently. Dependencies at the same BFS depth fetch in parallel, then effective-POM parsing and graph expansion continue in deterministic queue order.
+- Same-depth batching gives network parallelism without changing nearest-wins conflict semantics.
+- Do not rewrite the resolver around async `reqwest` unless blocking plus bounded parallelism stops being enough.
+- Do not parallelize effective-POM parent/BOM expansion until races around shared descriptor paths are explicitly designed.
 
-### In progress
+## Benchmarks And Canaries
 
-- GitHub publication is pending a successful remote setup and push.
-- Parent POM inheritance, BOM imports, private repositories, mirrors, authentication, version ranges, and profile handling remain unsupported.
+- Keep canary source checkouts uncommitted.
+- Picocli's Maven examples are useful compatibility canaries, but the root picocli POM is not a useful resolver benchmark because it has no dependency graph.
+- Apache Commons Compress is the current real-world resolver canary because it stresses parent POMs, inherited properties, managed dependencies, optional dependencies, and a moderate runtime graph.
+- Commons Compress canary manifests, isolated Maven repos, and timing output should live under `/private/tmp`.
+- Benchmark warm-cache/offline resolver behavior against Maven's runtime dependency tree when comparing overhead.
+- Do not treat temporary Angra TOML canaries as proof of source `pom.xml` ingestion.
+- Do not benchmark cold network resolution as a primary signal; network variability hides resolver overhead.
 
-### Decisions made
+## Dependency Upgrade Notes
 
-- Use Apache-2.0 for the project license.
-- Keep benchmark output human-readable first, followed by raw JSON details.
-- Use dynamic latest Maven and Gradle versions via `mise` for local benchmark comparisons.
+- `reqwest` 0.13 uses the `rustls` feature; the old `rustls-tls` feature is gone.
+- Do not use `reqwest` 0.13's `rustls-no-provider` casually. It would require Angra to manage Rustls crypto-provider setup at runtime.
+- Cargo ignores semver build metadata in version requirements; write `toml = "1.1.2"` rather than `1.1.2+spec-1.1.0`.
+- `quick-xml` 0.40 text handling should decode text and then unescape XML entities explicitly.
+- `sha1` and `sha2` 0.11 finalized digest outputs no longer implement `LowerHex` directly. Hex-encode finalized bytes locally unless a broader formatting need justifies a dependency.
 
-### Next session priorities
+## Current Open Boundaries
 
-- Confirm GitHub remote and publish the initial repository if not completed.
-- Decide the next Maven compatibility slice: parent POM inheritance, BOM import support, or `pom.xml` ingestion.
-- Add more realistic benchmark fixtures as resolver compatibility expands.
+- Auth, Maven `<servers>`, and proxies are not implemented.
+- Snapshot behavior, version ranges, repository policies, and full Maven profile activation remain unresolved.
+- Local parent POM `<relativePath>` behavior remains unresolved.
+- Source `pom.xml` ingestion remains separate from artifact/POM resolution.
+- Maven plugin execution is deferred as an adoption gate, not part of the 1.0 inner-loop replacement.
+- The measured JVM worker spike belongs in the 0.4 compile/test milestone; do not commit to a persistent daemon before benchmarks justify it.
+
+## Next Priorities
+
+- Continue 0.2 resolver realism with the remaining Maven compatibility gaps: auth diagnostics, repository policies, snapshots, version ranges, and profile activation.
+- Re-run the Commons Compress canary after settings/mirror-related resolver changes.
+- Keep tests, clippy, and benchmark coverage aligned with any resolver behavior change.
+
+## Rejected Paths To Preserve
+
+- No durable memory was rejected; future sessions need decision continuity.
+- Treating TOML ergonomics as separate from Maven compatibility was rejected.
+- Full uv-equivalent scope before 1.0 was rejected as too broad.
+- Built-in JDK management was rejected for the current roadmap.
+- A flat backlog-only roadmap was rejected because it loses the narrative of what 1.0 means.
+- A separate architecture RFC was rejected in favor of folding strategic architecture decisions into the roadmap.
+- A full dependency graph abstraction was rejected for current failure attribution; queue path tracking is enough.
+- Adding a new hex-formatting dependency was rejected because local lowercase hex encoding is tiny.
+- Parsing auth or mirrors in the original settings repository slice was rejected to keep review boundaries small; mirrors have since landed, auth remains deferred.

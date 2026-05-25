@@ -24,15 +24,26 @@ Angra is very early. The current MVP focuses on dependency resolution.
   ```toml
   [dependencies]
   jackson = { group = "com.fasterxml.jackson.core", artifact = "jackson-databind", version = "2.17.2", scope = "runtime" }
+  native = { group = "com.example", artifact = "native-lib", version = "1.0.0", type = "jar", classifier = "linux-aarch64" }
+  webapp = { group = "com.example", artifact = "app", version = "1.0.0", type = "war" }
   ```
 
 - Maven local repository layout under `~/.m2/repository`
 - Maven Central downloads
+- Project-local repository declarations in `angra.toml`
 - Deterministic TOML lockfile generation via `angra.lock`
 - Runtime dependency graph resolution for compile/runtime scopes
+- Current-POM and inherited parent property interpolation
+- Parent POM inheritance for repository-resolved parents
+- Dependency management and BOM imports
+- `jar`, `pom`, and `war` dependency artifact types
+- Optional classifiers in structured dependencies and transitive POM dependencies
+- SHA-1 checksum verification for Maven Central downloads
+- Parallel same-depth artifact fetching during resolution
 - Optional dependency filtering
 - Exclusions
 - Basic nearest-wins conflict behavior
+- Colorized resolver errors with dependency paths for failed transitive artifacts
 - Comparative benchmark harness against Maven and Gradle through `mise`
 
 ## Install From Source
@@ -56,6 +67,9 @@ Create an `angra.toml`:
 group = "com.example"
 artifact = "demo"
 version = "0.1.0"
+
+[repositories]
+central = "https://repo1.maven.org/maven2"
 
 [dependencies]
 slf4j = "org.slf4j:slf4j-api:2.0.13"
@@ -110,11 +124,10 @@ The MVP intentionally does not support every Maven feature yet. In particular:
 - Private repositories
 - Mirrors
 - Authentication
-- BOM imports
+- Unknown Maven artifact types beyond `jar`, `pom`, and `war`
 - Version ranges
 - Maven profiles
-- Broad parent-POM inheritance
-- Inherited dependency property interpolation
+- Local parent lookup through `<relativePath>`
 
 Unsupported runtime dependency properties fail clearly instead of being guessed.
 

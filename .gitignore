@@ -6,6 +6,7 @@ angra.lock
 **/angra.lock
 
 # Benchmark output
+/benches/canary/
 /benches/results/
 **/.gradle/
 
@@ -23,3 +24,6 @@ angra.lock
 
 # Logs
 *.log
+
+tasks.md
+opencode.json
