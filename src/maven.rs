@@ -10,9 +10,22 @@ pub const MAVEN_CENTRAL_NAME: &str = "maven-central";
 pub const MAVEN_CENTRAL_URL: &str = "https://repo1.maven.org/maven2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryPolicy {
+    pub enabled: bool,
+}
+
+impl Default for RepositoryPolicy {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
     pub name: String,
     pub url: String,
+    pub releases: RepositoryPolicy,
+    pub snapshots: RepositoryPolicy,
 }
 
 impl Repository {
@@ -20,11 +33,41 @@ impl Repository {
         Self {
             name: name.to_string(),
             url: url.trim_end_matches('/').to_string(),
+            releases: RepositoryPolicy::default(),
+            snapshots: RepositoryPolicy::default(),
+        }
+    }
+
+    pub fn with_policies(
+        name: &str,
+        url: &str,
+        releases_enabled: bool,
+        snapshots_enabled: bool,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            url: url.trim_end_matches('/').to_string(),
+            releases: RepositoryPolicy {
+                enabled: releases_enabled,
+            },
+            snapshots: RepositoryPolicy {
+                enabled: snapshots_enabled,
+            },
         }
     }
 
     pub fn maven_central() -> Self {
-        Self::new(MAVEN_CENTRAL_NAME, MAVEN_CENTRAL_URL)
+        Self::with_policies(MAVEN_CENTRAL_NAME, MAVEN_CENTRAL_URL, true, false)
+    }
+
+    /// Returns true if this repository accepts artifacts with the given coordinate,
+    /// based on the release/snapshot policies.
+    pub fn accepts(&self, coordinate: &Coordinate) -> bool {
+        if coordinate.is_snapshot() {
+            self.snapshots.enabled
+        } else {
+            self.releases.enabled
+        }
     }
 
     pub fn pom_url(&self, coordinate: &Coordinate) -> String {
@@ -98,6 +141,11 @@ impl Coordinate {
             artifact: artifact.to_string(),
             version: version.to_string(),
         }
+    }
+
+    /// Returns true if this coordinate's version is a Maven SNAPSHOT version.
+    pub fn is_snapshot(&self) -> bool {
+        self.version.ends_with("-SNAPSHOT")
     }
 
     pub fn parse_without_version(raw: &str) -> Result<Self, CoordinateError> {
@@ -388,5 +436,45 @@ mod tests {
             ArtifactCoordinate::new(coordinate, ArtifactType::War, None).central_artifact_url(),
             "https://repo1.maven.org/maven2/com/example/demo/1.0.0/demo-1.0.0.war"
         );
+    }
+
+    #[test]
+    fn detects_snapshot_versions() {
+        assert!(Coordinate::new("com.example", "lib", "1.0.0-SNAPSHOT").is_snapshot());
+        assert!(Coordinate::new("com.example", "lib", "2.0-SNAPSHOT").is_snapshot());
+        assert!(!Coordinate::new("com.example", "lib", "1.0.0").is_snapshot());
+        assert!(!Coordinate::new("com.example", "lib", "1.0.0-jre").is_snapshot());
+        // Case-sensitive: lowercase doesn't count
+        assert!(!Coordinate::new("com.example", "lib", "1.0.0-snapshot").is_snapshot());
+    }
+
+    #[test]
+    fn maven_central_rejects_snapshots() {
+        let central = Repository::maven_central();
+        let release = Coordinate::new("com.example", "lib", "1.0.0");
+        let snapshot = Coordinate::new("com.example", "lib", "1.0.0-SNAPSHOT");
+
+        assert!(central.accepts(&release));
+        assert!(!central.accepts(&snapshot));
+    }
+
+    #[test]
+    fn default_repository_accepts_both() {
+        let repo = Repository::new("custom", "https://repo.example.com");
+        let release = Coordinate::new("com.example", "lib", "1.0.0");
+        let snapshot = Coordinate::new("com.example", "lib", "1.0.0-SNAPSHOT");
+
+        assert!(repo.accepts(&release));
+        assert!(repo.accepts(&snapshot));
+    }
+
+    #[test]
+    fn snapshot_only_repo_rejects_releases() {
+        let repo = Repository::with_policies("snapshots", "https://repo.example.com", false, true);
+        let release = Coordinate::new("com.example", "lib", "1.0.0");
+        let snapshot = Coordinate::new("com.example", "lib", "1.0.0-SNAPSHOT");
+
+        assert!(!repo.accepts(&release));
+        assert!(repo.accepts(&snapshot));
     }
 }

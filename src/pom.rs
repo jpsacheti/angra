@@ -6,7 +6,9 @@ use std::{
 
 use quick_xml::{Reader, escape::unescape, events::Event};
 
-use crate::maven::{ArtifactCoordinate, ArtifactIdentity, ArtifactType, Coordinate, Scope};
+use crate::maven::{
+    ArtifactCoordinate, ArtifactIdentity, ArtifactType, Coordinate, Repository, Scope,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct EffectivePom {
@@ -16,6 +18,7 @@ pub(crate) struct EffectivePom {
     pub properties: BTreeMap<String, String>,
     pub dependency_management: BTreeMap<ArtifactIdentity, ManagedDependency>,
     pub dependencies: Vec<PomDependency>,
+    pub repositories: Vec<Repository>,
 }
 
 impl EffectivePom {
@@ -36,6 +39,64 @@ pub(crate) struct ManagedDependency {
     pub exclusions: Vec<Coordinate>,
 }
 
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct PomRepositories {
+    #[serde(rename = "repository", default)]
+    pub(crate) repositories: Vec<PomRepository>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct PomRepositoryPolicy {
+    #[serde(default)]
+    pub(crate) enabled: Option<String>,
+}
+
+impl PomRepositoryPolicy {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+            .as_deref()
+            .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct PomRepository {
+    pub(crate) id: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) name: Option<String>,
+    pub(crate) url: Option<String>,
+    #[serde(default)]
+    pub(crate) releases: Option<PomRepositoryPolicy>,
+    #[serde(default)]
+    pub(crate) snapshots: Option<PomRepositoryPolicy>,
+}
+
+impl PomRepository {
+    pub(crate) fn resolve(
+        &self,
+        properties: &PomPropertyContext,
+        source: &str,
+    ) -> Result<Option<Repository>, PomError> {
+        let Some(url) = &self.url else {
+            return Ok(None);
+        };
+        let url = properties.interpolate(url, source)?;
+        let id = match &self.id {
+            Some(id) => properties.interpolate(id, source)?,
+            None => url.clone(),
+        };
+        let releases_enabled = self.releases.as_ref().is_none_or(|p| p.is_enabled());
+        let snapshots_enabled = self.snapshots.as_ref().is_none_or(|p| p.is_enabled());
+        Ok(Some(Repository::with_policies(
+            &id,
+            &url,
+            releases_enabled,
+            snapshots_enabled,
+        )))
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename = "project")]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +111,8 @@ pub(crate) struct Pom {
     dependency_management: PomDependencyManagement,
     #[serde(default)]
     dependencies: PomDependencies,
+    #[serde(default)]
+    repositories: PomRepositories,
 }
 
 impl Pom {
@@ -60,22 +123,34 @@ impl Pom {
         Ok(pom)
     }
 
+    pub(crate) fn property_context(&self) -> PomPropertyContext {
+        PomPropertyContext::new(
+            self.properties.clone(),
+            self.group_id.clone(),
+            self.artifact_id.clone(),
+            self.version.clone(),
+        )
+    }
+
     pub(crate) fn parent_coordinate(&self, source: &str) -> Result<Option<Coordinate>, PomError> {
         let Some(parent) = &self.parent else {
             return Ok(None);
         };
 
-        let context = PomPropertyContext::new(
-            self.properties.clone(),
-            self.group_id.clone(),
-            self.artifact_id.clone(),
-            self.version.clone(),
-        );
-
+        let context = self.property_context();
         parent.coordinate(&context, source)
     }
 
     pub(crate) fn effective_without_parent(&self) -> EffectivePom {
+        let context = self.property_context();
+        let mut repositories = Vec::new();
+        for repo in &self.repositories.repositories {
+            if let Ok(Some(resolved)) =
+                repo.resolve(&context, self.artifact_id.as_deref().unwrap_or("unknown"))
+            {
+                repositories.push(resolved);
+            }
+        }
         EffectivePom {
             group_id: self.group_id.clone(),
             artifact_id: self.artifact_id.clone(),
@@ -83,11 +158,15 @@ impl Pom {
             properties: self.properties.clone(),
             dependency_management: BTreeMap::new(),
             dependencies: self.dependencies.dependencies.clone(),
+            repositories,
         }
     }
 
     pub(crate) fn merge_with_parent(&self, parent: Option<EffectivePom>) -> EffectivePom {
-        let mut effective = parent.unwrap_or_else(|| self.effective_without_parent());
+        let mut effective = match parent {
+            Some(parent_effective) => parent_effective,
+            None => return self.effective_without_parent(),
+        };
 
         effective.group_id = self.group_id.clone().or(effective.group_id);
         effective.artifact_id = self.artifact_id.clone().or(effective.artifact_id);
@@ -95,6 +174,30 @@ impl Pom {
 
         effective.properties.extend(self.properties.clone());
         effective.dependencies = self.dependencies.dependencies.clone();
+
+        // Merge repositories: child overrides parent by ID/name
+        let context = self.property_context();
+        let mut child_repos = Vec::new();
+        for repo in &self.repositories.repositories {
+            if let Ok(Some(resolved)) =
+                repo.resolve(&context, self.artifact_id.as_deref().unwrap_or("unknown"))
+            {
+                child_repos.push(resolved);
+            }
+        }
+
+        for repo in child_repos {
+            if let Some(existing) = effective
+                .repositories
+                .iter_mut()
+                .find(|r| r.name == repo.name)
+            {
+                *existing = repo;
+            } else {
+                effective.repositories.push(repo);
+            }
+        }
+
         effective
     }
 
@@ -780,5 +883,161 @@ mod tests {
             resolved.artifact.to_string(),
             "com.example:native:jar:linux-aarch64:1.0.0"
         );
+    }
+
+    #[test]
+    fn parses_and_inherits_repositories() {
+        let dir = TempDir::new().unwrap();
+        let parent_pom = dir.path().join("parent.pom");
+        let child_pom = dir.path().join("child.pom");
+
+        fs::write(
+            &parent_pom,
+            r#"
+            <project>
+              <groupId>com.example</groupId>
+              <artifactId>parent</artifactId>
+              <version>1.0.0</version>
+              <repositories>
+                <repository>
+                  <id>parent-repo</id>
+                  <url>https://parent.example.com/maven2</url>
+                </repository>
+                <repository>
+                  <id>shared-repo</id>
+                  <url>https://parent-shared.example.com/maven2</url>
+                </repository>
+              </repositories>
+            </project>
+            "#,
+        )
+        .unwrap();
+
+        fs::write(
+            &child_pom,
+            r#"
+            <project>
+              <groupId>com.example</groupId>
+              <artifactId>child</artifactId>
+              <version>1.0.0</version>
+              <properties>
+                <custom.repo.url>https://child.example.com/maven2</custom.repo.url>
+              </properties>
+              <repositories>
+                <repository>
+                  <id>child-repo</id>
+                  <url>${custom.repo.url}</url>
+                </repository>
+                <repository>
+                  <id>shared-repo</id>
+                  <url>https://child-override.example.com/maven2</url>
+                </repository>
+              </repositories>
+            </project>
+            "#,
+        )
+        .unwrap();
+
+        let parent_parsed = Pom::read(&parent_pom).unwrap();
+        let parent_effective = parent_parsed.effective_without_parent();
+        assert_eq!(parent_effective.repositories.len(), 2);
+        assert_eq!(parent_effective.repositories[0].name, "parent-repo");
+        assert_eq!(
+            parent_effective.repositories[0].url,
+            "https://parent.example.com/maven2"
+        );
+
+        let child_parsed = Pom::read(&child_pom).unwrap();
+        let child_effective = child_parsed.merge_with_parent(Some(parent_effective));
+
+        assert_eq!(child_effective.repositories.len(), 3);
+
+        let parent_repo = child_effective
+            .repositories
+            .iter()
+            .find(|r| r.name == "parent-repo")
+            .unwrap();
+        assert_eq!(parent_repo.url, "https://parent.example.com/maven2");
+
+        let child_repo = child_effective
+            .repositories
+            .iter()
+            .find(|r| r.name == "child-repo")
+            .unwrap();
+        assert_eq!(child_repo.url, "https://child.example.com/maven2");
+
+        let shared_repo = child_effective
+            .repositories
+            .iter()
+            .find(|r| r.name == "shared-repo")
+            .unwrap();
+        assert_eq!(shared_repo.url, "https://child-override.example.com/maven2");
+    }
+
+    #[test]
+    fn parses_repository_policies_from_pom() {
+        let dir = TempDir::new().unwrap();
+        let pom_path = dir.path().join("pom.xml");
+
+        fs::write(
+            &pom_path,
+            r#"
+            <project>
+              <groupId>com.example</groupId>
+              <artifactId>test</artifactId>
+              <version>1.0.0</version>
+              <repositories>
+                <repository>
+                  <id>releases-only</id>
+                  <url>https://releases.example.com/maven2</url>
+                  <snapshots>
+                    <enabled>false</enabled>
+                  </snapshots>
+                </repository>
+                <repository>
+                  <id>snapshots-only</id>
+                  <url>https://snapshots.example.com/maven2</url>
+                  <releases>
+                    <enabled>false</enabled>
+                  </releases>
+                </repository>
+                <repository>
+                  <id>both</id>
+                  <url>https://both.example.com/maven2</url>
+                </repository>
+              </repositories>
+            </project>
+            "#,
+        )
+        .unwrap();
+
+        let pom = Pom::read(&pom_path).unwrap();
+        let effective = pom.effective_without_parent();
+
+        assert_eq!(effective.repositories.len(), 3);
+
+        let releases_only = effective
+            .repositories
+            .iter()
+            .find(|r| r.name == "releases-only")
+            .unwrap();
+        assert!(releases_only.releases.enabled);
+        assert!(!releases_only.snapshots.enabled);
+
+        let snapshots_only = effective
+            .repositories
+            .iter()
+            .find(|r| r.name == "snapshots-only")
+            .unwrap();
+        assert!(!snapshots_only.releases.enabled);
+        assert!(snapshots_only.snapshots.enabled);
+
+        let both = effective
+            .repositories
+            .iter()
+            .find(|r| r.name == "both")
+            .unwrap();
+        assert!(both.releases.enabled);
+        assert!(both.snapshots.enabled);
     }
 }

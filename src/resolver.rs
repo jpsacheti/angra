@@ -34,6 +34,7 @@ struct QueuedDependency {
     depth: usize,
     exclusions: Vec<Coordinate>,
     path: Vec<ArtifactCoordinate>,
+    repositories: Vec<Repository>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,10 +58,16 @@ pub fn resolve_project(options: ResolveOptions) -> Result<Lockfile, ResolveError
     settings.apply_mirrors(&mut repositories);
     let local_repo = options
         .local_repo
-        .or(settings.local_repository)
+        .or(settings.local_repository.clone())
         .map(Ok)
         .unwrap_or_else(default_local_repo)?;
-    let resolver = Resolver::new(local_repo, repositories, options.offline, options.refresh)?;
+    let resolver = Resolver::new(
+        local_repo,
+        repositories,
+        settings.clone(),
+        options.offline,
+        options.refresh,
+    )?;
     let artifacts = resolver.resolve(dependencies)?;
 
     let lockfile = Lockfile::new(
@@ -87,6 +94,7 @@ pub fn resolve_project(options: ResolveOptions) -> Result<Lockfile, ResolveError
 struct Resolver {
     local_repo: PathBuf,
     repositories: Vec<Repository>,
+    settings: MavenSettings,
     offline: bool,
     refresh: bool,
     client: Client,
@@ -96,12 +104,14 @@ impl Resolver {
     fn new(
         local_repo: PathBuf,
         repositories: Vec<Repository>,
+        settings: MavenSettings,
         offline: bool,
         refresh: bool,
     ) -> Result<Self, ResolveError> {
         Ok(Self {
             local_repo,
             repositories,
+            settings,
             offline,
             refresh,
             client: Client::builder().http1_only().build()?,
@@ -126,6 +136,7 @@ impl Resolver {
                 scope: dependency.scope,
                 depth: 0,
                 exclusions: dependency.exclusions,
+                repositories: self.repositories.clone(),
             });
         }
 
@@ -184,11 +195,23 @@ impl Resolver {
                 }
 
                 let pom = self
-                    .effective_pom(&item.artifact.coordinate)
+                    .effective_pom(&item.artifact.coordinate, &item.repositories)
                     .map_err(|source| {
                         ResolveError::with_dependency_path(item.path.clone(), source)
                     })?;
                 let property_context = pom.property_context();
+
+                let mut active_repos = item.repositories.clone();
+                let mut pom_repos = pom.repositories.clone();
+                self.settings.apply_mirrors(&mut pom_repos);
+                for repo in pom_repos {
+                    if let Some(existing) = active_repos.iter_mut().find(|r| r.name == repo.name) {
+                        *existing = repo;
+                    } else {
+                        active_repos.push(repo);
+                    }
+                }
+
                 for dependency in pom.dependencies {
                     let Some(dependency_scope) = dependency.graph_scope() else {
                         continue;
@@ -232,6 +255,7 @@ impl Resolver {
                         depth: item.depth + 1,
                         exclusions,
                         path,
+                        repositories: active_repos.clone(),
                     });
                 }
             }
@@ -256,7 +280,7 @@ impl Resolver {
                     .iter()
                     .map(|item| {
                         scope.spawn(move || {
-                            self.ensure_artifact(&item.artifact)
+                            self.ensure_artifact(&item.artifact, &item.repositories)
                                 .map(|source| (item.artifact.identity(), source))
                                 .map_err(|source| {
                                     ResolveError::with_dependency_path(item.path.clone(), source)
@@ -281,13 +305,18 @@ impl Resolver {
         Ok(fetched)
     }
 
-    fn effective_pom(&self, coordinate: &Coordinate) -> Result<EffectivePom, ResolveError> {
-        self.effective_pom_inner(coordinate, &mut Vec::new())
+    fn effective_pom(
+        &self,
+        coordinate: &Coordinate,
+        repositories: &[Repository],
+    ) -> Result<EffectivePom, ResolveError> {
+        self.effective_pom_inner(coordinate, repositories, &mut Vec::new())
     }
 
     fn effective_pom_inner(
         &self,
         coordinate: &Coordinate,
+        repositories: &[Repository],
         stack: &mut Vec<String>,
     ) -> Result<EffectivePom, ResolveError> {
         let key = coordinate.to_string();
@@ -298,10 +327,10 @@ impl Resolver {
         }
 
         stack.push(key.clone());
-        self.ensure_pom(coordinate)?;
+        self.ensure_pom(coordinate, repositories)?;
         let raw = Pom::read(&coordinate.pom_path(&self.local_repo))?;
         let parent = if let Some(parent) = raw.parent_coordinate(&key)? {
-            Some(self.effective_pom_inner(&parent, stack)?)
+            Some(self.effective_pom_inner(&parent, repositories, stack)?)
         } else {
             None
         };
@@ -313,7 +342,7 @@ impl Resolver {
                 let Some(bom) = dependency.coordinate(&properties, &key)? else {
                     continue;
                 };
-                let bom = self.effective_pom_inner(&bom, stack)?;
+                let bom = self.effective_pom_inner(&bom, repositories, stack)?;
                 effective
                     .dependency_management
                     .extend(bom.dependency_management);
@@ -329,7 +358,11 @@ impl Resolver {
         Ok(effective)
     }
 
-    fn ensure_artifact(&self, artifact: &ArtifactCoordinate) -> Result<String, ResolveError> {
+    fn ensure_artifact(
+        &self,
+        artifact: &ArtifactCoordinate,
+        repositories: &[Repository],
+    ) -> Result<String, ResolveError> {
         let pom_path = artifact.pom_path(&self.local_repo);
         let artifact_path = artifact.artifact_path(&self.local_repo);
         let descriptor_only =
@@ -343,13 +376,23 @@ impl Resolver {
                     return Err(ResolveError::OfflineMissing(artifact.to_string()));
                 }
 
-                self.download_artifact(artifact, &pom_path, &artifact_path, descriptor_only)?
+                self.download_artifact(
+                    artifact,
+                    repositories,
+                    &pom_path,
+                    &artifact_path,
+                    descriptor_only,
+                )?
             };
 
         Ok(source)
     }
 
-    fn ensure_pom(&self, coordinate: &Coordinate) -> Result<String, ResolveError> {
+    fn ensure_pom(
+        &self,
+        coordinate: &Coordinate,
+        repositories: &[Repository],
+    ) -> Result<String, ResolveError> {
         let pom_path = coordinate.pom_path(&self.local_repo);
 
         let source = if !self.refresh && pom_path.exists() {
@@ -359,7 +402,7 @@ impl Resolver {
                 return Err(ResolveError::OfflineMissing(coordinate.to_string()));
             }
 
-            self.download_pom(coordinate, &pom_path)?
+            self.download_pom(coordinate, repositories, &pom_path)?
         };
 
         Ok(source)
@@ -368,6 +411,7 @@ impl Resolver {
     fn download_artifact(
         &self,
         artifact: &ArtifactCoordinate,
+        repositories: &[Repository],
         pom_path: &Path,
         artifact_path: &Path,
         descriptor_only: bool,
@@ -376,7 +420,11 @@ impl Resolver {
         let mut not_found = Vec::new();
         let needs_pom = self.refresh || !pom_path.exists();
 
-        for repository in &self.repositories {
+        for repository in repositories {
+            if !repository.accepts(&artifact.coordinate) {
+                continue;
+            }
+
             let result: Result<String, ResolveError> = (|| {
                 if needs_pom {
                     self.download(&repository.pom_url(&artifact.coordinate), pom_path)?;
@@ -405,12 +453,17 @@ impl Resolver {
     fn download_pom(
         &self,
         coordinate: &Coordinate,
+        repositories: &[Repository],
         pom_path: &Path,
     ) -> Result<String, ResolveError> {
         fs::create_dir_all(coordinate.local_dir(&self.local_repo))?;
         let mut not_found = Vec::new();
 
-        for repository in &self.repositories {
+        for repository in repositories {
+            if !repository.accepts(coordinate) {
+                continue;
+            }
+
             let result = self
                 .download(&repository.pom_url(coordinate), pom_path)
                 .map(|_| repository.name.clone());
@@ -449,7 +502,17 @@ impl Resolver {
             .map_err(|source| ResolveError::Download {
                 url: url.to_string(),
                 source,
-            })?
+            })?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(ResolveError::AuthenticationRequired {
+                url: url.to_string(),
+                status: status.as_u16(),
+            });
+        }
+
+        let response = response
             .error_for_status()
             .map_err(|source| ResolveError::Download {
                 url: url.to_string(),
@@ -505,25 +568,13 @@ fn sha256_file(path: &Path) -> Result<String, ResolveError> {
         hasher.update(&buffer[..read]);
     }
 
-    Ok(hex_bytes(&hasher.finalize()))
+    Ok(faster_hex::hex_string(&hasher.finalize()))
 }
 
 fn sha1_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(bytes);
-    hex_bytes(&hasher.finalize())
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-
-    output
+    faster_hex::hex_string(&hasher.finalize())
 }
 
 fn checksum_path(path: &Path) -> PathBuf {
@@ -613,6 +664,12 @@ pub enum ResolveError {
     Http(#[from] reqwest::Error),
     #[error("failed to download `{url}`: {source}")]
     Download { url: String, source: reqwest::Error },
+    #[error(
+        "repository at `{url}` requires authentication (HTTP {status}). \
+            Angra does not yet support authenticated repositories. \
+            Configure a mirror in ~/.m2/settings.xml or use a repository that does not require credentials."
+    )]
+    AuthenticationRequired { url: String, status: u16 },
     #[error("checksum mismatch for `{url}`: expected {expected}, got {actual}")]
     ChecksumMismatch {
         url: String,
@@ -672,6 +729,11 @@ impl ResolveError {
             _ => false,
         }
     }
+
+    #[cfg(test)]
+    fn is_auth_required(&self) -> bool {
+        matches!(self, Self::AuthenticationRequired { .. })
+    }
 }
 
 #[cfg(test)]
@@ -722,7 +784,14 @@ mod tests {
         write_artifact(&repo, &child, "<project/>");
         write_artifact(&repo, &optional, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -752,7 +821,14 @@ mod tests {
         write_artifact(&repo, &first, "<project/>");
         write_artifact(&repo, &second, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![
                 DeclaredDependency {
@@ -809,7 +885,14 @@ mod tests {
         );
         write_artifact(&repo, &child, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -872,7 +955,14 @@ mod tests {
         );
         write_artifact(&repo, &child, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -922,7 +1012,14 @@ mod tests {
         );
         write_artifact(&repo, &child, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -973,7 +1070,14 @@ mod tests {
         );
         write_artifact(&repo, &child, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -1046,7 +1150,14 @@ mod tests {
         );
         write_artifact(&repo, &child, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -1091,7 +1202,14 @@ mod tests {
         );
         write_typed_artifact(&repo, &native, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -1141,7 +1259,14 @@ mod tests {
         );
         write_typed_artifact(&repo, &webapp, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -1184,7 +1309,14 @@ mod tests {
         );
         write_typed_artifact(&repo, &descriptor, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -1223,7 +1355,14 @@ mod tests {
             "#,
         );
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let error = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -1321,7 +1460,14 @@ mod tests {
         );
         write_artifact(&repo, &child, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -1358,7 +1504,14 @@ mod tests {
         );
         write_artifact(&repo, &excluded, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -1402,7 +1555,14 @@ mod tests {
         );
         write_artifact(&repo, &loser, "<project/>");
 
-        let resolver = Resolver::new(repo, vec![Repository::maven_central()], true, false).unwrap();
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
         let resolved = resolver
             .resolve(vec![DeclaredDependency {
                 alias: "root".to_string(),
@@ -1418,5 +1578,253 @@ mod tests {
             .unwrap();
 
         assert_eq!(shared.artifact.coordinate.version, "1.0.0");
+    }
+
+    #[test]
+    fn propagates_lexically_scoped_repositories() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("m2");
+
+        let root_a = Coordinate::new("com.example", "root-a", "1.0.0");
+        let child_a = Coordinate::new("com.example", "child-a", "1.0.0");
+        let _grandchild_a = Coordinate::new("com.example", "grandchild-a", "1.0.0");
+
+        let root_b = Coordinate::new("com.example", "root-b", "1.0.0");
+        let child_b = Coordinate::new("com.example", "child-b", "1.0.0");
+        let _grandchild_b = Coordinate::new("com.example", "grandchild-b", "1.0.0");
+
+        // Write root-a POM with custom-repo-a, which depends on child-a
+        write_artifact(
+            &repo,
+            &root_a,
+            r#"
+            <project>
+              <repositories>
+                <repository>
+                  <id>custom-repo-a</id>
+                  <url>https://repo.maven.apache.org/maven2</url>
+                </repository>
+              </repositories>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>child-a</artifactId>
+                  <version>1.0.0</version>
+                </dependency>
+              </dependencies>
+            </project>
+            "#,
+        );
+        // Write child-a POM (local) which depends on grandchild-a (not in local repo)
+        write_artifact(
+            &repo,
+            &child_a,
+            r#"
+            <project>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>grandchild-a</artifactId>
+                  <version>1.0.0</version>
+                </dependency>
+              </dependencies>
+            </project>
+            "#,
+        );
+
+        // Write root-b POM with custom-repo-b, which depends on child-b
+        write_artifact(
+            &repo,
+            &root_b,
+            r#"
+            <project>
+              <repositories>
+                <repository>
+                  <id>custom-repo-b</id>
+                  <url>https://repo.clojars.org</url>
+                </repository>
+              </repositories>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>child-b</artifactId>
+                  <version>1.0.0</version>
+                </dependency>
+              </dependencies>
+            </project>
+            "#,
+        );
+        // Write child-b POM (local) which depends on grandchild-b (not in local repo)
+        write_artifact(
+            &repo,
+            &child_b,
+            r#"
+            <project>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>grandchild-b</artifactId>
+                  <version>1.0.0</version>
+                </dependency>
+              </dependencies>
+            </project>
+            "#,
+        );
+
+        // Run resolution for root-a (offline = false, so it tries custom-repo-a)
+        let resolver = Resolver::new(
+            repo.clone(),
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let err_a = resolver
+            .resolve(vec![DeclaredDependency {
+                alias: "root-a".to_string(),
+                artifact: ArtifactCoordinate::jar(root_a),
+                scope: Scope::Compile,
+                exclusions: Vec::new(),
+            }])
+            .unwrap_err();
+
+        // The grandchild-a resolution should fail to download and report searched repositories
+        let cause_a = err_a.root_cause();
+        if let ResolveError::ArtifactNotFound { repositories, .. } = cause_a {
+            assert!(repositories.contains(&"maven-central".to_string()));
+            assert!(repositories.contains(&"custom-repo-a".to_string()));
+            assert!(!repositories.contains(&"custom-repo-b".to_string()));
+        } else {
+            panic!("Expected ArtifactNotFound error, got {:?}", err_a);
+        }
+
+        // Run resolution for root-b (offline = false, so it tries custom-repo-b)
+        let err_b = resolver
+            .resolve(vec![DeclaredDependency {
+                alias: "root-b".to_string(),
+                artifact: ArtifactCoordinate::jar(root_b),
+                scope: Scope::Compile,
+                exclusions: Vec::new(),
+            }])
+            .unwrap_err();
+
+        let cause_b = err_b.root_cause();
+        if let ResolveError::ArtifactNotFound { repositories, .. } = cause_b {
+            assert!(repositories.contains(&"maven-central".to_string()));
+            assert!(repositories.contains(&"custom-repo-b".to_string()));
+            assert!(!repositories.contains(&"custom-repo-a".to_string()));
+        } else {
+            panic!("Expected ArtifactNotFound error, got {:?}", err_b);
+        }
+    }
+
+    #[test]
+    fn skips_release_only_repo_for_snapshot_artifact() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("m2");
+
+        // SNAPSHOT artifact — not in local repo
+        let snapshot = Coordinate::new("com.example", "lib", "1.0.0-SNAPSHOT");
+
+        // A release-only repo (like Maven Central) should be skipped entirely.
+        // A snapshot-enabled repo should be tried but fail (offline).
+        let release_only =
+            Repository::with_policies("release-only", "https://releases.example.com", true, false);
+        let snapshot_enabled =
+            Repository::with_policies("snapshot-repo", "https://snapshots.example.com", true, true);
+
+        let resolver = Resolver::new(
+            repo,
+            vec![release_only, snapshot_enabled],
+            MavenSettings::default(),
+            true, // offline
+            false,
+        )
+        .unwrap();
+
+        let error = resolver
+            .resolve(vec![DeclaredDependency {
+                alias: "lib".to_string(),
+                artifact: ArtifactCoordinate::jar(snapshot),
+                scope: Scope::Compile,
+                exclusions: Vec::new(),
+            }])
+            .unwrap_err();
+
+        // The error should be OfflineMissing since there's a valid snapshot repo
+        // but we're offline and the artifact isn't in the local repo.
+        assert!(matches!(
+            error.root_cause(),
+            ResolveError::OfflineMissing(_)
+        ));
+    }
+
+    #[test]
+    fn skips_snapshot_only_repo_for_release_artifact() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("m2");
+
+        let release = Coordinate::new("com.example", "lib", "1.0.0");
+        write_artifact(&repo, &release, "<project/>");
+
+        // Only a snapshot-only repo — it should be skipped for releases.
+        // But since the artifact is already in local repo, it resolves from local.
+        let snapshot_only = Repository::with_policies(
+            "snapshot-only",
+            "https://snapshots.example.com",
+            false,
+            true,
+        );
+
+        let resolver = Resolver::new(
+            repo,
+            vec![snapshot_only],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let resolved = resolver
+            .resolve(vec![DeclaredDependency {
+                alias: "lib".to_string(),
+                artifact: ArtifactCoordinate::jar(release),
+                scope: Scope::Compile,
+                exclusions: Vec::new(),
+            }])
+            .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].source, "local");
+    }
+
+    #[test]
+    fn auth_required_error_message_is_actionable() {
+        let error = ResolveError::AuthenticationRequired {
+            url: "https://repo.example.com/com/example/lib/1.0.0/lib-1.0.0.jar".to_string(),
+            status: 401,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("401"));
+        assert!(message.contains("authentication"));
+        assert!(message.contains("does not yet support"));
+        assert!(message.contains("mirror"));
+        assert!(error.is_auth_required());
+        assert!(!error.is_not_found());
+    }
+
+    #[test]
+    fn auth_required_403_error() {
+        let error = ResolveError::AuthenticationRequired {
+            url: "https://repo.example.com/artifact.jar".to_string(),
+            status: 403,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("403"));
+        assert!(message.contains("does not yet support"));
     }
 }
