@@ -52,17 +52,24 @@ fn run() -> Result<(), ResolveError> {
             refresh,
             project_dir,
         } => {
-            let lockfile = resolve_project(ResolveOptions {
+            let output = resolve_project(ResolveOptions {
                 project_dir,
                 offline,
                 refresh,
                 local_repo: None,
             })?;
 
+            for warning in &output.warnings {
+                eprintln!(
+                    "{} {warning}",
+                    paint("warning:", &format!("{BOLD}\x1b[33m"))
+                );
+            }
+
             println!(
                 "{} resolved {} artifacts into {}",
                 paint("success:", GREEN),
-                paint(&lockfile.artifacts.len().to_string(), BOLD),
+                paint(&output.lockfile.artifacts.len().to_string(), BOLD),
                 paint("angra.lock", CYAN)
             );
         }

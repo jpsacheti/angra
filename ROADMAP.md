@@ -4,7 +4,7 @@ Angra aims to be a fast, Maven-compatible Java project tool — `uv` ergonomics 
 
 This roadmap covers milestones **0.1 through 1.0**, ending at a usable replacement for everyday Maven workflows (resolve, add deps, build, test, run, package). The core architecture is a Rust driver that keeps normal CLI operations JVM-free, spawning Java only when compilation, tests, runtime execution, or future plugin compatibility require it. Publishing, built-in JDK management, IDE plugins, Maven plugin execution, and the long tail of Maven feature parity are deferred — see the [Deferred](#deferred) section. The decision log lives in [MEMORY.md](MEMORY.md).
 
-- **Last updated:** 2026-05-24 (settings.xml read-only)
+- **Last updated:** 2026-05-26 (resolver full compatibility push)
 - **Current milestone:** 0.2 (in progress — effective POM support started)
 
 ## Status legend
@@ -39,21 +39,23 @@ In `master` today:
 **Scope:**
 
 - POM property interpolation: `${project.version}`, user-defined `<properties>`. Current-POM and inherited parent property interpolation have initial support.
-- Parent POM inheritance: recursive `<parent>` resolution, merged properties + `<dependencyManagement>`. Initial support landed through effective POM construction.
-- `<dependencyManagement>` honored in the transitive graph for version pinning. Initial support landed for managed versions, scopes, and exclusions.
-- BOM imports (`<scope>import</scope>` inside `<dependencyManagement>`). Initial support landed for imported BOM dependency management.
+- Parent POM inheritance: recursive `<parent>` resolution, merged properties + `<dependencyManagement>`. Initial support landed through effective POM construction, including local `<relativePath>` lookup before repository fallback.
+- `<dependencyManagement>` honored in the transitive graph for version pinning. Initial support landed for managed versions, scopes, and exclusions. Angra-native `[dependency-management]` declarations provide the same resolver controls in `angra.toml`.
+- BOM imports (`<scope>import</scope>` inside `<dependencyManagement>`). Initial support landed for imported BOM dependency management, including TOML BOM imports with `scope = "import"`.
 - Classifier + packaging (`pom`, `jar`, `war`). Initial resolver support landed for structured TOML dependencies and transitive POM dependencies, including artifact-neutral lockfile fields.
-- Angra-managed project repositories via `[repositories]` in `angra.toml`. Initial unauthenticated repository support landed; Maven Central remains the default when omitted.
-- Global Angra config for reusable repositories at `~/.config/angra/config.toml` on Unix-like systems, with platform config directory support on Windows. Initial repository support landed; project repos override globals by name while preserving declaration order.
-- Repository config from `~/.m2/settings.xml` (read-only — auth deferred): initial support landed for `<localRepository>` and active-profile `<repositories>`. Activation honors explicit `<activeProfiles>` and `<activeByDefault>`; property/OS/JDK/file-based activation is deferred. Mirrors remain a follow-up.
+- Angra-managed project repositories via `[repositories]` in `angra.toml`. Compact `name = "url"` and structured repository declarations are supported; Maven Central remains the default when omitted.
+- Global Angra config for reusable repositories at `~/.config/angra/config.toml` on Unix-like systems, with platform config directory support on Windows. Compact and structured repository support landed; project repos override globals by name while preserving declaration order.
+- Repository config from `~/.m2/settings.xml` (read-only — auth deferred): initial support landed for `<localRepository>`, active-profile `<repositories>`, mirrors, repository policies, and active-profile properties.
+- Maven profile activation for resolver-relevant POM sections: manifest-controlled active/inactive profile IDs, `activeByDefault`, property, OS, JDK, and file activation inject profile dependencies, dependency management, properties, and repositories.
+- Maven metadata resolution: version ranges and timestamped SNAPSHOT artifacts resolve from `maven-metadata.xml`; lockfiles record the concrete resolved version and the requested range/SNAPSHOT when they differ.
 - Parallel artifact downloads and metadata fetches. Initial same-depth parallel artifact fetch landed; effective-POM expansion remains deterministic and sequential after each fetch batch.
 - Cache metadata aggressively without corrupting Maven compatibility: keep artifact files in a Maven-compatible layout, but add an internal index for fast metadata/version lookup if profiling shows repeated filesystem scans are material.
-- Checksum verification against `.sha1` sibling files on Maven Central. Initial strict SHA-1 verification landed for remote downloads.
+- Checksum verification against `.sha1` sibling files. Strict SHA-1 verification remains Angra's default; repository `checksumPolicy` can warn or ignore when explicitly configured.
 - Failure attribution: when a coord fails, print the dependency path that pulled it in. Initial support landed for resolver failures with colorized CLI output.
 
 **Critical files:** `src/resolver.rs` (most of the change), `src/maven.rs` (`.sha1` URLs, classifiers), `src/pom.rs` for effective-model behavior, and a possible cache/index module after profiling.
 
-**Exit criteria:** A `spring-boot-starter-web` fixture resolves cleanly and matches Maven's resolution set. Bench harness gains a `spring-boot` case.
+**Exit criteria:** A Spring Boot fixture resolves cleanly and matches Maven's runtime resolution set. Bench harness gains a Spring fixture case.
 
 ---
 
@@ -151,7 +153,7 @@ Intentionally not on the 0.1 → 1.0 path:
 - **Built-in JDK management**: delegation to `mise` / SDKMan is the long-term answer through 1.0.
 - **Persistent JVM daemon**: a warm background JVM may be needed for excellent repeated compile/test performance, but it should follow measured 0.4 worker results rather than become baseline complexity.
 - **IDE integration**: IntelliJ plugin, LSP server, Eclipse `.classpath` export beyond `angra tree --machine-readable`.
-- **Maven feature parity (long tail)**: profiles, version ranges (`[1.0,2.0)`), mirrors with auth, encrypted `settings-security.xml`, snapshot timestamping nuance.
+- **Maven feature parity (long tail)**: mirrors with auth, encrypted `settings-security.xml`, full Maven build/plugin model behavior, and edge-case profile/build-model semantics beyond resolver-relevant POM sections.
 - **Maven plugin execution**: arbitrary `<build><plugins>` from imported POMs. This is the major adoption gate for replacing Maven in plugin-heavy builds. Through 1.0, Angra implements native equivalents for the common inner-loop tasks above rather than hosting Maven's full plugin model. Post-1.0 compatibility should use the Rust driver plus JVM worker boundary if plugin execution becomes a target.
 - **Multi-language**: Kotlin, Scala, Groovy, mixed-source modules.
 - **Reproducible builds**: bit-for-bit jar reproducibility, normalized timestamps.

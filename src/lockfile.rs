@@ -18,6 +18,8 @@ pub struct LockedArtifact {
     pub group: String,
     pub artifact: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_version: Option<String>,
     #[serde(rename = "type")]
     pub artifact_type: ArtifactType,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,6 +34,7 @@ pub struct LockedArtifact {
 impl LockedArtifact {
     pub fn new(
         artifact: &ArtifactCoordinate,
+        requested_version: Option<&str>,
         scope: Scope,
         source: &str,
         pom_path: PathBuf,
@@ -42,6 +45,7 @@ impl LockedArtifact {
             group: artifact.coordinate.group.clone(),
             artifact: artifact.coordinate.artifact.clone(),
             version: artifact.coordinate.version.clone(),
+            requested_version: requested_version.map(str::to_string),
             artifact_type: artifact.artifact_type,
             classifier: artifact.classifier.clone(),
             scope,
@@ -105,6 +109,7 @@ mod tests {
     fn serializes_stable_lockfile() {
         let lockfile = Lockfile::new(vec![LockedArtifact::new(
             &ArtifactCoordinate::jar(crate::maven::Coordinate::new("b", "a", "1")),
+            None,
             Scope::Compile,
             "local",
             PathBuf::from("/m2/b/a/1/a-1.pom"),

@@ -61,9 +61,9 @@ fn print_summary(results: &[BenchmarkResult]) {
         println!(
             "{:<12} {:>12} {:>12} {:>12} {:>18} {:>18}",
             case,
-            format_duration(angra),
-            format_duration(maven),
-            format_duration(gradle),
+            format_result_duration(results, case, BenchmarkTool::Angra),
+            format_result_duration(results, case, BenchmarkTool::Maven),
+            format_result_duration(results, case, BenchmarkTool::Gradle),
             format_speedup(angra, maven),
             format_speedup(angra, gradle)
         );
@@ -77,10 +77,15 @@ fn duration_ms(results: &[BenchmarkResult], case: &str, tool: BenchmarkTool) -> 
         .map(|result| result.duration_ms)
 }
 
-fn format_duration(duration_ms: Option<u128>) -> String {
-    duration_ms
-        .map(|duration_ms| format!("{duration_ms} ms"))
-        .unwrap_or_else(|| "failed".to_string())
+fn format_result_duration(results: &[BenchmarkResult], case: &str, tool: BenchmarkTool) -> String {
+    match results
+        .iter()
+        .find(|result| result.case == case && result.tool == tool)
+    {
+        Some(result) if result.status == 0 => format!("{} ms", result.duration_ms),
+        Some(_) => "failed".to_string(),
+        None => "n/a".to_string(),
+    }
 }
 
 fn format_speedup(angra_ms: Option<u128>, other_ms: Option<u128>) -> String {

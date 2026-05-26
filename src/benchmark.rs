@@ -12,7 +12,7 @@ pub struct BenchmarkCase {
     pub directory: PathBuf,
     pub angra_args: Vec<String>,
     pub maven_args: Vec<String>,
-    pub gradle_args: Vec<String>,
+    pub gradle_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -36,28 +36,45 @@ pub enum BenchmarkTool {
 }
 
 pub fn fixture_cases(root: &Path) -> Vec<BenchmarkCase> {
-    ["direct", "transitive", "conflict"]
+    let mut cases = ["direct", "transitive", "conflict"]
         .into_iter()
         .map(|name| BenchmarkCase {
             name: name.to_string(),
             directory: root.join("benches").join("fixtures").join(name),
             angra_args: vec!["resolve".to_string()],
             maven_args: vec!["dependency:go-offline".to_string()],
-            gradle_args: vec![
+            gradle_args: Some(vec![
                 "--no-daemon".to_string(),
                 "dependencies".to_string(),
                 "--configuration".to_string(),
                 "runtimeClasspath".to_string(),
-            ],
+            ]),
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let spring_fixture = root.join("benches").join("spring-fixture");
+    if spring_fixture.join("angra.toml").exists() && spring_fixture.join("pom.xml").exists() {
+        cases.push(BenchmarkCase {
+            name: "spring-fixture".to_string(),
+            directory: spring_fixture,
+            angra_args: vec!["resolve".to_string()],
+            maven_args: vec![
+                "dependency:list".to_string(),
+                "-DincludeScope=runtime".to_string(),
+                "-DoutputFile=/private/tmp/angra-spring-benchmark-runtime-deps.txt".to_string(),
+            ],
+            gradle_args: None,
+        });
+    }
+
+    cases
 }
 
 pub fn run_case(
     case: &BenchmarkCase,
     angra_binary: &Path,
 ) -> Result<Vec<BenchmarkResult>, BenchmarkError> {
-    Ok(vec![
+    let mut results = vec![
         run_command(
             BenchmarkTool::Angra,
             &case.name,
@@ -72,14 +89,19 @@ pub fn run_case(
             Path::new("mise"),
             &mise_args("maven", "mvn", &case.maven_args),
         )?,
-        run_command(
+    ];
+
+    if let Some(gradle_args) = &case.gradle_args {
+        results.push(run_command(
             BenchmarkTool::Gradle,
             &case.name,
             &case.directory,
             Path::new("mise"),
-            &mise_args("gradle", "gradle", &case.gradle_args),
-        )?,
-    ])
+            &mise_args("gradle", "gradle", gradle_args),
+        )?);
+    }
+
+    Ok(results)
 }
 
 fn mise_args(tool: &str, command: &str, args: &[String]) -> Vec<String> {
