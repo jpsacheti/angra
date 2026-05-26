@@ -96,7 +96,24 @@ impl MavenSettings {
                 if id.is_empty() || url.is_empty() || !seen.insert(id.to_string()) {
                     continue;
                 }
-                repositories.push(Repository::new(id, url));
+                let releases_enabled = repository
+                    .releases
+                    .as_ref()
+                    .and_then(|p| p.enabled.as_deref())
+                    .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+                    .unwrap_or(true);
+                let snapshots_enabled = repository
+                    .snapshots
+                    .as_ref()
+                    .and_then(|p| p.enabled.as_deref())
+                    .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+                    .unwrap_or(true);
+                repositories.push(Repository::with_policies(
+                    id,
+                    url,
+                    releases_enabled,
+                    snapshots_enabled,
+                ));
             }
         }
 
@@ -218,10 +235,19 @@ struct ProfileRepositories {
     repository: Vec<ProfileRepository>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RawRepositoryPolicy {
+    enabled: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ProfileRepository {
     id: Option<String>,
     url: Option<String>,
+    #[serde(default)]
+    releases: Option<RawRepositoryPolicy>,
+    #[serde(default)]
+    snapshots: Option<RawRepositoryPolicy>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -714,5 +740,70 @@ mod tests {
         settings.apply_mirrors(&mut repos);
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].name, "central");
+    }
+
+    #[test]
+    fn parses_repository_policies_from_settings() {
+        let settings = MavenSettings::parse(
+            r#"
+            <settings>
+              <profiles>
+                <profile>
+                  <id>default</id>
+                  <activation>
+                    <activeByDefault>true</activeByDefault>
+                  </activation>
+                  <repositories>
+                    <repository>
+                      <id>releases-only</id>
+                      <url>https://releases.example.com/maven/</url>
+                      <snapshots>
+                        <enabled>false</enabled>
+                      </snapshots>
+                    </repository>
+                    <repository>
+                      <id>snapshots-only</id>
+                      <url>https://snapshots.example.com/maven/</url>
+                      <releases>
+                        <enabled>false</enabled>
+                      </releases>
+                    </repository>
+                    <repository>
+                      <id>both</id>
+                      <url>https://both.example.com/maven/</url>
+                    </repository>
+                  </repositories>
+                </profile>
+              </profiles>
+            </settings>
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.repositories.len(), 3);
+
+        let releases_only = settings
+            .repositories
+            .iter()
+            .find(|r| r.name == "releases-only")
+            .unwrap();
+        assert!(releases_only.releases.enabled);
+        assert!(!releases_only.snapshots.enabled);
+
+        let snapshots_only = settings
+            .repositories
+            .iter()
+            .find(|r| r.name == "snapshots-only")
+            .unwrap();
+        assert!(!snapshots_only.releases.enabled);
+        assert!(snapshots_only.snapshots.enabled);
+
+        let both = settings
+            .repositories
+            .iter()
+            .find(|r| r.name == "both")
+            .unwrap();
+        assert!(both.releases.enabled);
+        assert!(both.snapshots.enabled);
     }
 }

@@ -70,6 +70,8 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Do not silently append Maven Central after configured repositories. Configured repositories are explicit.
 - Do not sort repositories by name; order is semantically meaningful fallback behavior.
 - A separate `--config` flag is premature.
+- Additional remote repositories declared in POMs are isolated using Lexically Scoped Repositories (Approach A). Each dependency in the resolution queue carries its own list of permitted active repositories. Discovered repositories are merged down to children and descendants, preventing "repository leakage/pollution" across unrelated packages. This was chosen over global dynamic appending for safety and predictability, matching modern tools like Cargo and uv.
+- Settings mirrors are applied dynamically to POM-discovered repositories before they are used to fetch artifacts.
 
 ## Maven Settings Decisions
 
@@ -94,6 +96,23 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Do not fall back to MD5.
 - Do not reverify already-cached local files on every resolve; warm-cache speed matters. This can be revisited when Maven checksum policies are modeled.
 - Full Maven checksum policy behavior is deferred until settings policy support exists.
+
+## Repository Policy Decisions
+
+- Repositories carry release and snapshot policies modeled as `RepositoryPolicy { enabled: bool }`.
+- Maven Central defaults to releases=true, snapshots=false, matching real Maven Central behavior.
+- All other repositories (angra.toml, global config, settings, POM-declared) default to both enabled unless explicitly overridden.
+- SNAPSHOT detection uses the `-SNAPSHOT` suffix convention (case-sensitive). Full SNAPSHOT timestamp/build-number resolution (e.g. `1.0-20240101.120000-1`) remains deferred.
+- Repository policies are parsed from POM `<releases><enabled>` and `<snapshots><enabled>` elements, and from settings.xml profile repository policy elements.
+- The resolver skips repositories whose policy does not match the artifact version type before attempting any download.
+- No `updatePolicy`, `checksumPolicy`, or other policy sub-elements are modeled yet.
+
+## Auth Diagnostics
+
+- HTTP 401 (Unauthorized) and 403 (Forbidden) responses are intercepted and produce a dedicated `AuthenticationRequired` error.
+- The error message explicitly states that Angra does not yet support authenticated repositories and suggests configuring a mirror or using a public repository.
+- Auth errors immediately fail resolution rather than falling through to the next repository, since a 401/403 from a repo that should have the artifact is a real signal.
+- Actual authentication (`<servers>`, credentials, tokens) remains deferred.
 
 ## Resolver Diagnostics And Performance
 
@@ -126,8 +145,8 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 
 ## Current Open Boundaries
 
-- Auth, Maven `<servers>`, and proxies are not implemented.
-- Snapshot behavior, version ranges, repository policies, and full Maven profile activation remain unresolved.
+- Auth implementation (Maven `<servers>`, credentials, tokens) and proxies are not implemented. Auth errors are diagnosed with actionable messages.
+- Snapshot timestamp/build-number resolution, version ranges, and full Maven profile activation remain unresolved.
 - Local parent POM `<relativePath>` behavior remains unresolved.
 - Source `pom.xml` ingestion remains separate from artifact/POM resolution.
 - Maven plugin execution is deferred as an adoption gate, not part of the 1.0 inner-loop replacement.
@@ -135,7 +154,7 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 
 ## Next Priorities
 
-- Continue 0.2 resolver realism with the remaining Maven compatibility gaps: auth diagnostics, repository policies, snapshots, version ranges, and profile activation.
+- Continue 0.2 resolver realism with the remaining Maven compatibility gaps: snapshots, version ranges, and profile activation.
 - Re-run the Commons Compress canary after settings/mirror-related resolver changes.
 - Keep tests, clippy, and benchmark coverage aligned with any resolver behavior change.
 
@@ -148,5 +167,25 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - A flat backlog-only roadmap was rejected because it loses the narrative of what 1.0 means.
 - A separate architecture RFC was rejected in favor of folding strategic architecture decisions into the roadmap.
 - A full dependency graph abstraction was rejected for current failure attribution; queue path tracking is enough.
-- Adding a new hex-formatting dependency was rejected because local lowercase hex encoding is tiny.
+- A manual bit-flipping hex-encoding function was initially implemented but subsequently rejected in favor of the highly optimized, SIMD-accelerated 'faster-hex' library to prioritize maximum runtime speed and code safety over compile-time savings.
 - Parsing auth or mirrors in the original settings repository slice was rejected to keep review boundaries small; mirrors have since landed, auth remains deferred.
+
+## Session Summary - 2026-05-24
+
+- **Worked on:** Repository policy basics (releases/snapshots checking in resolver and POM/settings parsing), dynamic settings-based mirrors matching and application, deferred authentication diagnostic handling, and hex-encoding optimization.
+- **Completed:**
+  - `RepositoryPolicy` support with case-sensitive snapshot detection.
+  - Dynamic settings mirrors matching (`*`, negation, comma-separated), deduplication, and repository rewrite.
+  - `AuthenticationRequired` custom error diagnostic providing actionable steps on 401/403 intercept.
+  - Integrated `faster-hex` library for SIMD-accelerated checksum hex serialization.
+  - Created the `feature/repo-policies-and-mirror` branch and committed all work with 77 unit tests, 7 integration tests, formatting, and clippy passing cleanly.
+- **In progress:** None.
+- **Decisions made:**
+  - Adopted `faster-hex` dependency to prioritize runtime performance over compile time.
+  - Selected lexically scoped repositories (Approach A) to prevent repository leakage across dependencies.
+  - Rejected setting up local git pre-commit hooks for now, leaving validation checks for a future comprehensive CI pipeline.
+- **Next session priorities:**
+  - Implement full SNAPSHOT timestamp/build-number resolution.
+  - Add version ranges support.
+  - Implement full Maven profile activation logic (property, OS, JDK, and file-based activations).
+  - Re-run the Commons Compress canary to verify resolution performance with settings and mirrors applied.
