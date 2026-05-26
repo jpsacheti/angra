@@ -3,6 +3,7 @@ pub mod config;
 pub mod lockfile;
 pub mod manifest;
 pub mod maven;
+mod metadata;
 mod pom;
 pub mod resolver;
 pub mod settings;
