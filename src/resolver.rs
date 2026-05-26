@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::Mutex,
     thread,
 };
 
@@ -13,9 +14,16 @@ use sha2::{Digest, Sha256};
 use crate::{
     config::GlobalConfig,
     lockfile::{LockedArtifact, Lockfile, LockfileError},
-    manifest::{DeclaredDependency, Manifest, ManifestError},
-    maven::{ArtifactCoordinate, ArtifactIdentity, ArtifactType, Coordinate, Repository, Scope},
-    pom::{EffectivePom, Pom, PomError},
+    manifest::{
+        DeclaredDependency, DeclaredManagedDependency, ManagedDependencyScope, Manifest,
+        ManifestError,
+    },
+    maven::{
+        ArtifactCoordinate, ArtifactIdentity, ArtifactType, ChecksumPolicy, Coordinate, Repository,
+        RepositoryPolicy, Scope, VersionRange,
+    },
+    metadata::MavenMetadata,
+    pom::{EffectivePom, ManagedDependency, Pom, PomError, ProfileActivationContext},
     settings::MavenSettings,
 };
 
@@ -25,6 +33,12 @@ pub struct ResolveOptions {
     pub offline: bool,
     pub refresh: bool,
     pub local_repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveOutput {
+    pub lockfile: Lockfile,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +54,7 @@ struct QueuedDependency {
 #[derive(Debug, Clone)]
 struct ResolvedArtifact {
     artifact: ArtifactCoordinate,
+    requested_version: Option<String>,
     scope: Scope,
     depth: usize,
     pom_path: PathBuf,
@@ -47,12 +62,54 @@ struct ResolvedArtifact {
     source: String,
 }
 
-pub fn resolve_project(options: ResolveOptions) -> Result<Lockfile, ResolveError> {
+#[derive(Debug, Clone)]
+struct FetchedArtifact {
+    artifact: ArtifactCoordinate,
+    requested_version: Option<String>,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedVersion {
+    coordinate: Coordinate,
+    requested_version: Option<String>,
+}
+
+impl ResolvedVersion {
+    fn artifact(
+        self,
+        artifact_type: ArtifactType,
+        classifier: Option<String>,
+    ) -> ResolvedArtifactVersion {
+        ResolvedArtifactVersion {
+            artifact: ArtifactCoordinate::new(self.coordinate, artifact_type, classifier),
+            requested_version: self.requested_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedArtifactVersion {
+    artifact: ArtifactCoordinate,
+    requested_version: Option<String>,
+}
+
+pub fn resolve_project(options: ResolveOptions) -> Result<ResolveOutput, ResolveError> {
     let manifest_path = options.project_dir.join("angra.toml");
     let manifest = Manifest::read(&manifest_path)?;
     let dependencies = manifest.declared_dependencies()?;
+    let dependency_management = manifest.declared_dependency_management()?;
     let global_config = GlobalConfig::load()?;
     let settings = MavenSettings::load()?;
+    let mut activation_properties = settings.properties.clone();
+    activation_properties.extend(manifest.resolver.maven.properties.clone());
+    let profile_activation = ProfileActivationContext::new(
+        manifest.resolver.maven.active_profiles.clone(),
+        manifest.resolver.maven.inactive_profiles.clone(),
+        activation_properties,
+        manifest.resolver.maven.java_version.clone(),
+        options.project_dir.clone(),
+    );
     let mut repositories =
         manifest.declared_repositories(&global_config.repositories(), &settings.repositories);
     settings.apply_mirrors(&mut repositories);
@@ -61,14 +118,17 @@ pub fn resolve_project(options: ResolveOptions) -> Result<Lockfile, ResolveError
         .or(settings.local_repository.clone())
         .map(Ok)
         .unwrap_or_else(default_local_repo)?;
-    let resolver = Resolver::new(
+    let resolver = Resolver::new_with_activation(
         local_repo,
         repositories,
         settings.clone(),
+        profile_activation,
         options.offline,
         options.refresh,
     )?;
-    let artifacts = resolver.resolve(dependencies)?;
+    let artifacts =
+        resolver.resolve_with_dependency_management(dependencies, dependency_management)?;
+    let warnings = resolver.into_warnings();
 
     let lockfile = Lockfile::new(
         artifacts
@@ -77,6 +137,7 @@ pub fn resolve_project(options: ResolveOptions) -> Result<Lockfile, ResolveError
                 let sha = sha256_file(&artifact.artifact_path)?;
                 Ok(LockedArtifact::new(
                     &artifact.artifact,
+                    artifact.requested_version.as_deref(),
                     artifact.scope,
                     &artifact.source,
                     artifact.pom_path,
@@ -88,19 +149,24 @@ pub fn resolve_project(options: ResolveOptions) -> Result<Lockfile, ResolveError
     );
 
     lockfile.write_if_changed(&options.project_dir.join("angra.lock"))?;
-    Ok(lockfile)
+    Ok(ResolveOutput { lockfile, warnings })
 }
 
 struct Resolver {
     local_repo: PathBuf,
     repositories: Vec<Repository>,
     settings: MavenSettings,
+    profile_activation: ProfileActivationContext,
     offline: bool,
     refresh: bool,
     client: Client,
+    warnings: Mutex<Vec<String>>,
+    pom_cache: Mutex<BTreeMap<String, EffectivePom>>,
+    path_pom_cache: Mutex<BTreeMap<PathBuf, EffectivePom>>,
 }
 
 impl Resolver {
+    #[cfg(test)]
     fn new(
         local_repo: PathBuf,
         repositories: Vec<Repository>,
@@ -108,20 +174,66 @@ impl Resolver {
         offline: bool,
         refresh: bool,
     ) -> Result<Self, ResolveError> {
+        Self::new_with_activation(
+            local_repo,
+            repositories,
+            settings,
+            ProfileActivationContext::default(),
+            offline,
+            refresh,
+        )
+    }
+
+    fn new_with_activation(
+        local_repo: PathBuf,
+        repositories: Vec<Repository>,
+        settings: MavenSettings,
+        profile_activation: ProfileActivationContext,
+        offline: bool,
+        refresh: bool,
+    ) -> Result<Self, ResolveError> {
+        let warnings = Mutex::new(Vec::new());
+        for repo in &repositories {
+            if let ChecksumPolicy::Unknown(ref policy) = repo.releases.checksum_policy {
+                warnings.lock().expect("warnings list poisoned").push(format!("unknown checksum policy '{policy}' for repository '{}', defaulting to fail", repo.name));
+            }
+            if let ChecksumPolicy::Unknown(ref policy) = repo.snapshots.checksum_policy {
+                warnings.lock().expect("warnings list poisoned").push(format!("unknown checksum policy '{policy}' for repository '{}', defaulting to fail", repo.name));
+            }
+        }
         Ok(Self {
             local_repo,
             repositories,
             settings,
+            profile_activation,
             offline,
             refresh,
             client: Client::builder().http1_only().build()?,
+            warnings,
+            pom_cache: Mutex::new(BTreeMap::new()),
+            path_pom_cache: Mutex::new(BTreeMap::new()),
         })
     }
 
+    fn into_warnings(self) -> Vec<String> {
+        self.warnings.into_inner().expect("warnings list poisoned")
+    }
+
+    #[cfg(test)]
     fn resolve(
         &self,
         dependencies: Vec<DeclaredDependency>,
     ) -> Result<Vec<ResolvedArtifact>, ResolveError> {
+        self.resolve_with_dependency_management(dependencies, Vec::new())
+    }
+
+    fn resolve_with_dependency_management(
+        &self,
+        dependencies: Vec<DeclaredDependency>,
+        dependency_management: Vec<DeclaredManagedDependency>,
+    ) -> Result<Vec<ResolvedArtifact>, ResolveError> {
+        let root_dependency_management =
+            self.resolve_declared_dependency_management(dependency_management)?;
         let mut queue = VecDeque::new();
         let direct_identities = dependencies
             .iter()
@@ -172,30 +284,33 @@ impl Resolver {
 
             for item in candidates {
                 let identity = item.artifact.identity();
-                let fetched = fetched_sources.remove(&identity).unwrap_or_else(|| {
-                    unreachable!("parallel fetch did not return source for {identity:?}")
-                });
+                let Some(fetched) = fetched_sources.remove(&identity) else {
+                    return Err(ResolveError::Internal(format!(
+                        "parallel fetch did not return source for {identity:?}"
+                    )));
+                };
 
                 selected.insert(
                     identity.clone(),
                     ResolvedArtifact {
-                        artifact: item.artifact.clone(),
+                        artifact: fetched.artifact.clone(),
+                        requested_version: fetched.requested_version.clone(),
                         scope: item.scope,
                         depth: item.depth,
-                        pom_path: item.artifact.pom_path(&self.local_repo),
-                        artifact_path: item.artifact.artifact_path(&self.local_repo),
-                        source: fetched,
+                        pom_path: fetched.artifact.pom_path(&self.local_repo),
+                        artifact_path: fetched.artifact.artifact_path(&self.local_repo),
+                        source: fetched.source,
                     },
                 );
                 selected_exclusions.insert(identity, item.exclusions.clone());
 
-                let version_key = item.artifact.to_string();
+                let version_key = fetched.artifact.to_string();
                 if !visited_versions.insert(version_key) {
                     continue;
                 }
 
                 let pom = self
-                    .effective_pom(&item.artifact.coordinate, &item.repositories)
+                    .effective_pom(&fetched.artifact.coordinate, &item.repositories)
                     .map_err(|source| {
                         ResolveError::with_dependency_path(item.path.clone(), source)
                     })?;
@@ -220,11 +335,14 @@ impl Resolver {
                         continue;
                     }
 
-                    let Some(resolved_dependency) = dependency
+                    let mut combined_dependency_management = pom.dependency_management.clone();
+                    combined_dependency_management.extend(root_dependency_management.clone());
+
+                    let Some(mut resolved_dependency) = dependency
                         .resolve(
                             &property_context,
                             &item.artifact.coordinate.to_string(),
-                            &pom.dependency_management,
+                            &combined_dependency_management,
                         )
                         .map_err(|source| {
                             ResolveError::with_dependency_path(item.path.clone(), source.into())
@@ -232,7 +350,18 @@ impl Resolver {
                     else {
                         continue;
                     };
-                    let artifact = resolved_dependency.artifact;
+                    if let Some(managed) =
+                        root_dependency_management.get(&resolved_dependency.artifact.identity())
+                        && let Some(version) = &managed.version
+                    {
+                        resolved_dependency.artifact.coordinate.version = version.clone();
+                    }
+                    let artifact = self
+                        .resolve_artifact_version(&resolved_dependency.artifact, &active_repos)
+                        .map(|resolved| resolved.artifact)
+                        .map_err(|source| {
+                            ResolveError::with_dependency_path(item.path.clone(), source)
+                        })?;
                     if !resolved_dependency.scope.is_runtime_graph() {
                         continue;
                     }
@@ -264,43 +393,90 @@ impl Resolver {
         Ok(selected.into_values().collect())
     }
 
+    fn resolve_declared_dependency_management(
+        &self,
+        dependencies: Vec<DeclaredManagedDependency>,
+    ) -> Result<BTreeMap<ArtifactIdentity, ManagedDependency>, ResolveError> {
+        let mut managed = BTreeMap::new();
+        for dependency in dependencies {
+            match dependency.scope {
+                ManagedDependencyScope::Import => {
+                    let bom = self.effective_pom_inner(
+                        &dependency.artifact.coordinate,
+                        &self.repositories,
+                        &mut Vec::new(),
+                    )?;
+                    managed.extend(bom.dependency_management);
+                }
+                ManagedDependencyScope::None | ManagedDependencyScope::Graph(_) => {
+                    managed.insert(
+                        dependency.artifact.identity(),
+                        ManagedDependency {
+                            version: Some(dependency.artifact.coordinate.version),
+                            scope: match dependency.scope {
+                                ManagedDependencyScope::Graph(scope) => Some(scope),
+                                ManagedDependencyScope::None | ManagedDependencyScope::Import => {
+                                    None
+                                }
+                            },
+                            exclusions: dependency.exclusions,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(managed)
+    }
+
     fn ensure_artifacts_parallel(
         &self,
         items: &[QueuedDependency],
-    ) -> Result<BTreeMap<ArtifactIdentity, String>, ResolveError> {
+    ) -> Result<BTreeMap<ArtifactIdentity, FetchedArtifact>, ResolveError> {
         let mut fetched = BTreeMap::new();
         let parallelism = thread::available_parallelism()
             .map(|parallelism| parallelism.get())
             .unwrap_or(4)
             .max(1);
 
-        for chunk in items.chunks(parallelism) {
-            let results = thread::scope(|scope| {
-                let handles = chunk
-                    .iter()
-                    .map(|item| {
-                        scope.spawn(move || {
-                            self.ensure_artifact(&item.artifact, &item.repositories)
-                                .map(|source| (item.artifact.identity(), source))
-                                .map_err(|source| {
-                                    ResolveError::with_dependency_path(item.path.clone(), source)
-                                })
-                        })
-                    })
-                    .collect::<Vec<_>>();
+        let num_threads = parallelism.min(items.len()).max(1);
+        let queue = Mutex::new(items.iter().collect::<VecDeque<_>>());
+        let (tx, rx) = std::sync::mpsc::channel();
 
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join())
-                    .collect::<Vec<_>>()
-            });
-
-            for result in results {
-                let (identity, source) =
-                    result.map_err(|_| ResolveError::ParallelWorkerPanic)??;
-                fetched.insert(identity, source);
+        thread::scope(|scope| {
+            for _ in 0..num_threads {
+                let queue_ref = &queue;
+                let tx_ref = tx.clone();
+                scope.spawn(move || {
+                    loop {
+                        let next_item = {
+                            let mut q = queue_ref.lock().expect("queue poisoned");
+                            q.pop_front()
+                        };
+                        let Some(item) = next_item else {
+                            break;
+                        };
+                        let result = self
+                            .ensure_artifact(&item.artifact, &item.repositories)
+                            .map(|fetched| (item.artifact.identity(), fetched))
+                            .map_err(|source| {
+                                ResolveError::with_dependency_path(item.path.clone(), source)
+                            });
+                        if tx_ref.send(result).is_err() {
+                            break;
+                        }
+                    }
+                });
             }
-        }
+
+            drop(tx);
+
+            while let Ok(result) = rx.recv() {
+                let (identity, fetched_artifact) = result?;
+                fetched.insert(identity, fetched_artifact);
+            }
+
+            Ok::<(), ResolveError>(())
+        })?;
 
         Ok(fetched)
     }
@@ -320,6 +496,10 @@ impl Resolver {
         stack: &mut Vec<String>,
     ) -> Result<EffectivePom, ResolveError> {
         let key = coordinate.to_string();
+        if let Some(cached) = self.pom_cache.lock().expect("pom cache poisoned").get(&key) {
+            return Ok(cached.clone());
+        }
+
         if let Some(cycle_start) = stack.iter().position(|seen| seen == &key) {
             let mut cycle = stack[cycle_start..].to_vec();
             cycle.push(key);
@@ -327,15 +507,121 @@ impl Resolver {
         }
 
         stack.push(key.clone());
-        self.ensure_pom(coordinate, repositories)?;
-        let raw = Pom::read(&coordinate.pom_path(&self.local_repo))?;
+        let pom_path = self.ensure_pom(coordinate, repositories)?;
+        let raw = Pom::read(&pom_path)?;
         let parent = if let Some(parent) = raw.parent_coordinate(&key)? {
-            Some(self.effective_pom_inner(&parent, repositories, stack)?)
+            match self.effective_local_parent(&raw, &parent, &pom_path, repositories, stack)? {
+                Some(parent) => Some(parent),
+                None => Some(self.effective_pom_inner(&parent, repositories, stack)?),
+            }
         } else {
             None
         };
 
-        let mut effective = raw.merge_with_parent(parent);
+        let active_raw = raw.active_model(&self.profile_activation);
+        let mut effective = active_raw.merge_with_parent_with_context(parent, &self.profile_activation);
+        let properties = effective.property_context();
+        for dependency in active_raw.dependency_management_entries() {
+            if dependency.is_bom_import() {
+                let Some(bom) = dependency.coordinate(&properties, &key)? else {
+                    continue;
+                };
+                let bom = self.effective_pom_inner(&bom, repositories, stack)?;
+                effective
+                    .dependency_management
+                    .extend(bom.dependency_management);
+                continue;
+            }
+
+            if let Some((identity, managed)) = dependency.managed_dependency(&properties, &key)? {
+                effective.dependency_management.insert(identity, managed);
+            }
+        }
+
+        stack.pop();
+        self.pom_cache
+            .lock()
+            .expect("pom cache poisoned")
+            .insert(key, effective.clone());
+        Ok(effective)
+    }
+
+    fn effective_local_parent(
+        &self,
+        child: &Pom,
+        parent_coordinate: &Coordinate,
+        child_pom_path: &Path,
+        repositories: &[Repository],
+        stack: &mut Vec<String>,
+    ) -> Result<Option<EffectivePom>, ResolveError> {
+        let Some(parent_path) = child.relative_parent_path() else {
+            return Ok(None);
+        };
+
+        let Some(base_dir) = child_pom_path.parent() else {
+            return Ok(None);
+        };
+
+        let candidate_path = match parent_path {
+            Some(path) if path.as_os_str().is_empty() => return Ok(None),
+            Some(path) => base_dir.join(path),
+            None => base_dir.join("..").join("pom.xml"),
+        };
+
+        if !candidate_path.exists() {
+            return Ok(None);
+        }
+
+        let parent = self.effective_pom_from_path(&candidate_path, repositories, stack)?;
+        let matches_identity = parent.group_id.as_deref() == Some(parent_coordinate.group.as_str())
+            && parent.artifact_id.as_deref() == Some(parent_coordinate.artifact.as_str());
+        let matches_version = parent.version.as_deref().is_some_and(|version| {
+            version == parent_coordinate.version
+                || VersionRange::parse(&parent_coordinate.version)
+                    .is_ok_and(|range| range.contains(version))
+        });
+
+        if matches_identity && matches_version {
+            Ok(Some(parent))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn effective_pom_from_path(
+        &self,
+        path: &Path,
+        repositories: &[Repository],
+        stack: &mut Vec<String>,
+    ) -> Result<EffectivePom, ResolveError> {
+        // canonicalize() resolves symlinks. If two dependencies reach this path via different symlinks,
+        // the cache still hits the canonical path, though cache misses could occur if canonicalize fails.
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Some(cached) = self
+            .path_pom_cache
+            .lock()
+            .expect("path pom cache poisoned")
+            .get(&canonical_path)
+        {
+            return Ok(cached.clone());
+        }
+
+        let raw = Pom::read(path)?;
+        let key = path.display().to_string();
+        if stack.contains(&key) {
+            return Err(ResolveError::PomCycle(key));
+        }
+        stack.push(key.clone());
+        let parent = if let Some(parent) = raw.parent_coordinate(&key)? {
+            match self.effective_local_parent(&raw, &parent, path, repositories, stack)? {
+                Some(parent) => Some(parent),
+                None => Some(self.effective_pom_inner(&parent, repositories, stack)?),
+            }
+        } else {
+            None
+        };
+
+        let mut effective = raw.merge_with_parent_with_context(parent, &self.profile_activation);
         let properties = effective.property_context();
         for dependency in raw.dependency_management_entries() {
             if dependency.is_bom_import() {
@@ -355,6 +641,10 @@ impl Resolver {
         }
 
         stack.pop();
+        self.path_pom_cache
+            .lock()
+            .expect("path pom cache poisoned")
+            .insert(canonical_path, effective.clone());
         Ok(effective)
     }
 
@@ -362,7 +652,9 @@ impl Resolver {
         &self,
         artifact: &ArtifactCoordinate,
         repositories: &[Repository],
-    ) -> Result<String, ResolveError> {
+    ) -> Result<FetchedArtifact, ResolveError> {
+        let resolved = self.resolve_artifact_version(artifact, repositories)?;
+        let artifact = resolved.artifact;
         let pom_path = artifact.pom_path(&self.local_repo);
         let artifact_path = artifact.artifact_path(&self.local_repo);
         let descriptor_only =
@@ -377,7 +669,8 @@ impl Resolver {
                 }
 
                 self.download_artifact(
-                    artifact,
+                    &artifact,
+                    resolved.requested_version.as_deref(),
                     repositories,
                     &pom_path,
                     &artifact_path,
@@ -385,32 +678,201 @@ impl Resolver {
                 )?
             };
 
-        Ok(source)
+        Ok(FetchedArtifact {
+            artifact,
+            requested_version: resolved.requested_version,
+            source,
+        })
+    }
+
+    fn resolve_artifact_version(
+        &self,
+        artifact: &ArtifactCoordinate,
+        repositories: &[Repository],
+    ) -> Result<ResolvedArtifactVersion, ResolveError> {
+        self.resolve_coordinate_version(
+            &artifact.coordinate,
+            repositories,
+            artifact.artifact_type,
+            artifact.classifier.as_deref(),
+        )
+        .map(|resolved| resolved.artifact(artifact.artifact_type, artifact.classifier.clone()))
+    }
+
+    fn resolve_coordinate_version(
+        &self,
+        coordinate: &Coordinate,
+        repositories: &[Repository],
+        artifact_type: ArtifactType,
+        classifier: Option<&str>,
+    ) -> Result<ResolvedVersion, ResolveError> {
+        if VersionRange::is_range_spec(&coordinate.version) {
+            let range = VersionRange::parse(&coordinate.version)
+                .map_err(|error| ResolveError::Pom(error.to_string()))?;
+            let versions = self.metadata_versions(coordinate, repositories)?;
+            let Some(version) = range.highest_matching(versions.iter().map(String::as_str)) else {
+                return Err(ResolveError::VersionRangeNotFound {
+                    artifact: coordinate.to_string(),
+                    range: coordinate.version.clone(),
+                });
+            };
+            return Ok(ResolvedVersion {
+                coordinate: Coordinate::new(&coordinate.group, &coordinate.artifact, &version),
+                requested_version: Some(coordinate.version.clone()),
+            });
+        }
+
+        if coordinate.is_snapshot() {
+            let version =
+                self.snapshot_version(coordinate, repositories, artifact_type, classifier)?;
+            if version != coordinate.version {
+                return Ok(ResolvedVersion {
+                    coordinate: Coordinate::new(&coordinate.group, &coordinate.artifact, &version),
+                    requested_version: Some(coordinate.version.clone()),
+                });
+            }
+        }
+
+        Ok(ResolvedVersion {
+            coordinate: coordinate.clone(),
+            requested_version: None,
+        })
+    }
+
+    fn metadata_versions(
+        &self,
+        coordinate: &Coordinate,
+        repositories: &[Repository],
+    ) -> Result<Vec<String>, ResolveError> {
+        let mut versions = Vec::new();
+        if let Ok(metadata) = MavenMetadata::read(&coordinate.metadata_path(&self.local_repo)) {
+            versions.extend(metadata.versioning.latest);
+            versions.extend(metadata.versioning.release);
+            versions.extend(metadata.versioning.versions.versions);
+        }
+
+        if self.offline {
+            return Ok(versions);
+        }
+
+        for repository in repositories {
+            let metadata_path =
+                coordinate.repository_metadata_path(&self.local_repo, &repository.name);
+            if self.refresh || !metadata_path.exists() {
+                let _ = self.download_metadata(
+                    &repository.metadata_url(coordinate),
+                    &metadata_path,
+                    repository.policy_for(coordinate),
+                );
+            }
+            if let Ok(metadata) = MavenMetadata::read(&metadata_path) {
+                versions.extend(metadata.versioning.latest);
+                versions.extend(metadata.versioning.release);
+                versions.extend(metadata.versioning.versions.versions.into_iter().filter(
+                    |version| {
+                        repository.accepts(&Coordinate::new(
+                            &coordinate.group,
+                            &coordinate.artifact,
+                            version,
+                        ))
+                    },
+                ));
+            }
+        }
+
+        versions.sort();
+        versions.dedup();
+        Ok(versions)
+    }
+
+    fn snapshot_version(
+        &self,
+        coordinate: &Coordinate,
+        repositories: &[Repository],
+        artifact_type: ArtifactType,
+        classifier: Option<&str>,
+    ) -> Result<String, ResolveError> {
+        let extension = artifact_type.extension();
+        let classifier = classifier.unwrap_or("");
+        let mut selected = None::<(String, String)>;
+
+        if let Ok(metadata) = MavenMetadata::read(
+            &coordinate
+                .local_dir(&self.local_repo)
+                .join("maven-metadata.xml"),
+        ) && let Some(candidate) =
+            snapshot_candidate(&metadata, coordinate, extension, classifier)
+        {
+            selected = Some(candidate);
+        }
+
+        for repository in repositories {
+            if !repository.accepts(coordinate) {
+                continue;
+            }
+
+            let metadata_path =
+                coordinate.snapshot_metadata_path(&self.local_repo, &repository.name);
+            if !self.offline && (self.refresh || !metadata_path.exists()) {
+                let _ = self.download_metadata(
+                    &repository.snapshot_metadata_url(coordinate),
+                    &metadata_path,
+                    repository.policy_for(coordinate),
+                );
+            }
+
+            let Ok(metadata) = MavenMetadata::read(&metadata_path) else {
+                continue;
+            };
+            let candidate = snapshot_candidate(&metadata, coordinate, extension, classifier);
+
+            if let Some(candidate) = candidate
+                && selected
+                    .as_ref()
+                    // fixed-width yyyyMMddHHmmss format ensures lexicographic order == chronological
+                    .is_none_or(|(updated, _)| candidate.0 > *updated)
+            {
+                selected = Some(candidate);
+            }
+        }
+
+        Ok(selected
+            .map(|(_, version)| version)
+            .unwrap_or_else(|| coordinate.version.clone()))
     }
 
     fn ensure_pom(
         &self,
         coordinate: &Coordinate,
         repositories: &[Repository],
-    ) -> Result<String, ResolveError> {
+    ) -> Result<PathBuf, ResolveError> {
+        let resolved =
+            self.resolve_coordinate_version(coordinate, repositories, ArtifactType::Pom, None)?;
+        let coordinate = resolved.coordinate;
         let pom_path = coordinate.pom_path(&self.local_repo);
 
-        let source = if !self.refresh && pom_path.exists() {
+        if !self.refresh && pom_path.exists() {
             "local".to_string()
         } else {
             if self.offline {
                 return Err(ResolveError::OfflineMissing(coordinate.to_string()));
             }
 
-            self.download_pom(coordinate, repositories, &pom_path)?
+            self.download_pom(
+                &coordinate,
+                resolved.requested_version.as_deref(),
+                repositories,
+                &pom_path,
+            )?
         };
 
-        Ok(source)
+        Ok(pom_path)
     }
 
     fn download_artifact(
         &self,
         artifact: &ArtifactCoordinate,
+        requested_version: Option<&str>,
         repositories: &[Repository],
         pom_path: &Path,
         artifact_path: &Path,
@@ -426,11 +888,20 @@ impl Resolver {
             }
 
             let result: Result<String, ResolveError> = (|| {
+                let policy = repository.policy_for(&artifact.coordinate);
                 if needs_pom {
-                    self.download(&repository.pom_url(&artifact.coordinate), pom_path)?;
+                    self.download(
+                        &pom_url(repository, &artifact.coordinate, requested_version),
+                        pom_path,
+                        policy,
+                    )?;
                 }
                 if !descriptor_only {
-                    self.download(&repository.artifact_url(artifact), artifact_path)?;
+                    self.download(
+                        &artifact_url(repository, artifact, requested_version),
+                        artifact_path,
+                        policy,
+                    )?;
                 }
                 Ok(repository.name.clone())
             })();
@@ -453,6 +924,7 @@ impl Resolver {
     fn download_pom(
         &self,
         coordinate: &Coordinate,
+        requested_version: Option<&str>,
         repositories: &[Repository],
         pom_path: &Path,
     ) -> Result<String, ResolveError> {
@@ -465,7 +937,11 @@ impl Resolver {
             }
 
             let result = self
-                .download(&repository.pom_url(coordinate), pom_path)
+                .download(
+                    &pom_url(repository, coordinate, requested_version),
+                    pom_path,
+                    repository.policy_for(coordinate),
+                )
                 .map(|_| repository.name.clone());
 
             match result {
@@ -483,15 +959,73 @@ impl Resolver {
         })
     }
 
-    fn download(&self, url: &str, destination: &Path) -> Result<(), ResolveError> {
-        let bytes = self.download_bytes(url)?;
-        let checksum_url = format!("{url}.sha1");
-        let checksum_bytes = self.download_bytes(&checksum_url)?;
-        verify_sha1_checksum(url, &bytes, &checksum_url, &checksum_bytes)?;
+    fn download_metadata(
+        &self,
+        url: &str,
+        destination: &Path,
+        policy: &RepositoryPolicy,
+    ) -> Result<(), ResolveError> {
+        self.download(url, destination, policy)
+    }
 
-        fs::write(destination, bytes)?;
-        fs::write(checksum_path(destination), checksum_bytes)?;
+    fn download(
+        &self,
+        url: &str,
+        destination: &Path,
+        policy: &RepositoryPolicy,
+    ) -> Result<(), ResolveError> {
+        let bytes = self.download_bytes(url)?;
+        let checksum_bytes = if matches!(policy.checksum_policy, ChecksumPolicy::Ignore) {
+            None
+        } else {
+            let checksum_url = format!("{url}.sha1");
+            match self.download_bytes(&checksum_url) {
+                Ok(checksum_bytes) => {
+                    match verify_sha1_checksum(url, &bytes, &checksum_url, &checksum_bytes) {
+                        Ok(()) => Some(checksum_bytes),
+                        Err(error) if matches!(policy.checksum_policy, ChecksumPolicy::Warn) => {
+                            self.warn(error.to_string());
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if matches!(policy.checksum_policy, ChecksumPolicy::Warn) => {
+                    self.warn(error.to_string());
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp_ext = format!(
+            "tmp.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp_dest = destination.with_extension(&temp_ext);
+        fs::write(&temp_dest, &bytes)?;
+        fs::rename(&temp_dest, destination)?;
+
+        if let Some(checksum_bytes) = checksum_bytes {
+            let checksum_dest = checksum_path(destination);
+            let temp_checksum = checksum_dest.with_extension(&temp_ext);
+            fs::write(&temp_checksum, checksum_bytes)?;
+            fs::rename(&temp_checksum, &checksum_dest)?;
+        }
         Ok(())
+    }
+
+    fn warn(&self, message: String) {
+        self.warnings
+            .lock()
+            .expect("warnings list poisoned")
+            .push(message);
     }
 
     fn download_bytes(&self, url: &str) -> Result<Vec<u8>, ResolveError> {
@@ -583,6 +1117,94 @@ fn checksum_path(path: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
+fn pom_url(
+    repository: &Repository,
+    coordinate: &Coordinate,
+    requested_version: Option<&str>,
+) -> String {
+    let directory_version = remote_directory_version(&coordinate.version, requested_version);
+    format!(
+        "{}/{}/{}/{}/{}-{}.pom",
+        repository.url,
+        coordinate.group_path(),
+        coordinate.artifact,
+        directory_version,
+        coordinate.artifact,
+        coordinate.version
+    )
+}
+
+fn artifact_url(
+    repository: &Repository,
+    artifact: &ArtifactCoordinate,
+    requested_version: Option<&str>,
+) -> String {
+    if artifact.artifact_type == ArtifactType::Pom && artifact.classifier.is_none() {
+        return pom_url(repository, &artifact.coordinate, requested_version);
+    }
+
+    let directory_version =
+        remote_directory_version(&artifact.coordinate.version, requested_version);
+    format!(
+        "{}/{}/{}/{}/{}-{}.{}",
+        repository.url,
+        artifact.coordinate.group_path(),
+        artifact.coordinate.artifact,
+        directory_version,
+        artifact.coordinate.artifact,
+        artifact.version_suffix(),
+        artifact.artifact_type.extension()
+    )
+}
+
+fn remote_directory_version<'a>(
+    resolved_version: &'a str,
+    requested_version: Option<&'a str>,
+) -> &'a str {
+    requested_version
+        .filter(|version| version.ends_with("-SNAPSHOT"))
+        .unwrap_or(resolved_version)
+}
+
+fn snapshot_candidate(
+    metadata: &MavenMetadata,
+    coordinate: &Coordinate,
+    extension: &str,
+    classifier: &str,
+) -> Option<(String, String)> {
+    let versioning = &metadata.versioning;
+    versioning
+        .snapshot_versions
+        .snapshot_versions
+        .iter()
+        .find(|snapshot| {
+            snapshot.extension.as_deref() == Some(extension)
+                && snapshot.classifier.as_deref().unwrap_or("") == classifier
+        })
+        .and_then(|snapshot| {
+            snapshot
+                .value
+                .clone()
+                .map(|value| (snapshot.updated.clone().unwrap_or_default(), value))
+        })
+        .or_else(|| {
+            let snapshot = versioning.snapshot.as_ref()?;
+            if snapshot.local_copy {
+                return Some((
+                    versioning.last_updated.clone().unwrap_or_default(),
+                    coordinate.version.clone(),
+                ));
+            }
+            let timestamp = snapshot.timestamp.as_ref()?;
+            let build = snapshot.build_number?;
+            let base = coordinate.version.strip_suffix("-SNAPSHOT")?;
+            Some((
+                versioning.last_updated.clone().unwrap_or_default(),
+                format!("{base}-{timestamp}-{build}"),
+            ))
+        })
+}
+
 fn parse_sha1_checksum(url: &str, bytes: &[u8]) -> Result<String, ResolveError> {
     let raw = std::str::from_utf8(bytes).map_err(|_| ResolveError::InvalidChecksum {
         url: url.to_string(),
@@ -656,6 +1278,8 @@ pub enum ResolveError {
         artifact: String,
         repositories: Vec<String>,
     },
+    #[error("no version matching range `{range}` was found for `{artifact}`")]
+    VersionRangeNotFound { artifact: String, range: String },
     #[error("cyclic POM inheritance or BOM import path `{0}`")]
     PomCycle(String),
     #[error("{0}")]
@@ -667,15 +1291,17 @@ pub enum ResolveError {
     #[error(
         "repository at `{url}` requires authentication (HTTP {status}). \
             Angra does not yet support authenticated repositories. \
-            Configure a mirror in ~/.m2/settings.xml or use a repository that does not require credentials."
+            Consider configuring a mirror or using a public repository."
     )]
     AuthenticationRequired { url: String, status: u16 },
-    #[error("checksum mismatch for `{url}`: expected {expected}, got {actual}")]
+    #[error("checksum mismatch for `{url}`: expected `{expected}`, found `{actual}`")]
     ChecksumMismatch {
         url: String,
         expected: String,
         actual: String,
     },
+    #[error("internal resolver error: {0}")]
+    Internal(String),
     #[error("invalid SHA-1 checksum from `{url}`: {value:?}")]
     InvalidChecksum { url: String, value: String },
     #[error("failed filesystem operation: {0}")]
@@ -738,7 +1364,7 @@ impl ResolveError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     use tempfile::TempDir;
 
@@ -761,6 +1387,11 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn write_metadata(path: &Path, body: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
     }
 
     #[test]
@@ -1173,6 +1804,91 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(coordinates.contains(&"com.example:child:3.0.0".to_string()));
+    }
+
+    #[test]
+    fn applies_manifest_dependency_management_across_graph() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("m2");
+        let root = Coordinate::new("com.example", "root", "1.0.0");
+        let child = Coordinate::new("com.example", "child", "1.0.0");
+        let leaf_1 = Coordinate::new("com.example", "leaf", "1.0.0");
+        let leaf_2 = Coordinate::new("com.example", "leaf", "2.0.0");
+
+        write_artifact(
+            &repo,
+            &root,
+            r#"
+            <project>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>child</artifactId>
+                  <version>1.0.0</version>
+                </dependency>
+              </dependencies>
+            </project>
+            "#,
+        );
+        write_artifact(
+            &repo,
+            &child,
+            r#"
+            <project>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId>
+                    <artifactId>leaf</artifactId>
+                    <version>1.0.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>leaf</artifactId>
+                  <version>1.0.0</version>
+                </dependency>
+              </dependencies>
+            </project>
+            "#,
+        );
+        write_artifact(&repo, &leaf_1, "<project/>");
+        write_artifact(&repo, &leaf_2, "<project/>");
+
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
+        let resolved = resolver
+            .resolve_with_dependency_management(
+                vec![DeclaredDependency {
+                    alias: "root".to_string(),
+                    artifact: ArtifactCoordinate::jar(root),
+                    scope: Scope::Compile,
+                    exclusions: Vec::new(),
+                }],
+                vec![DeclaredManagedDependency {
+                    alias: "leaf".to_string(),
+                    artifact: ArtifactCoordinate::jar(leaf_2),
+                    scope: ManagedDependencyScope::None,
+                    exclusions: Vec::new(),
+                }],
+            )
+            .unwrap();
+
+        let coordinates = resolved
+            .iter()
+            .map(|artifact| artifact.artifact.coordinate.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(coordinates.contains(&"com.example:leaf:2.0.0".to_string()));
+        assert!(!coordinates.contains(&"com.example:leaf:1.0.0".to_string()));
     }
 
     #[test]
@@ -1826,5 +2542,246 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("403"));
         assert!(message.contains("does not yet support"));
+    }
+
+    #[test]
+    fn resolves_direct_version_range_from_local_metadata() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("m2");
+        let requested = Coordinate::new("com.example", "lib", "[1.0,2.0)");
+        let selected = Coordinate::new("com.example", "lib", "1.5.0");
+
+        write_metadata(
+            &requested.metadata_path(&repo),
+            r#"
+            <metadata>
+              <versioning>
+                <versions>
+                  <version>1.0.0</version>
+                  <version>1.5.0</version>
+                  <version>2.0.0</version>
+                </versions>
+              </versioning>
+            </metadata>
+            "#,
+        );
+        write_artifact(&repo, &selected, "<project/>");
+
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
+        let resolved = resolver
+            .resolve(vec![DeclaredDependency {
+                alias: "lib".to_string(),
+                artifact: ArtifactCoordinate::jar(requested),
+                scope: Scope::Compile,
+                exclusions: Vec::new(),
+            }])
+            .unwrap();
+
+        assert_eq!(resolved[0].artifact.coordinate.version, "1.5.0");
+        assert_eq!(resolved[0].requested_version.as_deref(), Some("[1.0,2.0)"));
+    }
+
+    #[test]
+    fn resolves_snapshot_timestamp_from_metadata() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("m2");
+        let requested = Coordinate::new("com.example", "lib", "1.0-SNAPSHOT");
+        let timestamped = Coordinate::new("com.example", "lib", "1.0-20240501.120000-3");
+
+        write_metadata(
+            &requested.local_dir(&repo).join("maven-metadata.xml"),
+            r#"
+            <metadata>
+              <versioning>
+                <snapshotVersions>
+                  <snapshotVersion>
+                    <extension>jar</extension>
+                    <value>1.0-20240501.120000-3</value>
+                    <updated>20240501120000</updated>
+                  </snapshotVersion>
+                </snapshotVersions>
+              </versioning>
+            </metadata>
+            "#,
+        );
+        write_artifact(&repo, &timestamped, "<project/>");
+
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::with_policies(
+                "snapshots",
+                "https://repo.example.com",
+                false,
+                true,
+            )],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
+        let resolved = resolver
+            .resolve(vec![DeclaredDependency {
+                alias: "lib".to_string(),
+                artifact: ArtifactCoordinate::jar(requested),
+                scope: Scope::Compile,
+                exclusions: Vec::new(),
+            }])
+            .unwrap();
+
+        assert_eq!(
+            resolved[0].artifact.coordinate.version,
+            "1.0-20240501.120000-3"
+        );
+        assert_eq!(
+            resolved[0].requested_version.as_deref(),
+            Some("1.0-SNAPSHOT")
+        );
+    }
+
+    #[test]
+    fn injects_active_pom_profile_dependencies() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("m2");
+        let root = Coordinate::new("com.example", "root", "1.0.0");
+        let child = Coordinate::new("com.example", "profile-child", "1.0.0");
+
+        write_artifact(
+            &repo,
+            &root,
+            r#"
+            <project>
+              <profiles>
+                <profile>
+                  <id>dev</id>
+                  <activation>
+                    <property>
+                      <name>environment</name>
+                      <value>dev</value>
+                    </property>
+                  </activation>
+                  <dependencies>
+                    <dependency>
+                      <groupId>com.example</groupId>
+                      <artifactId>profile-child</artifactId>
+                      <version>1.0.0</version>
+                    </dependency>
+                  </dependencies>
+                </profile>
+              </profiles>
+            </project>
+            "#,
+        );
+        write_artifact(&repo, &child, "<project/>");
+
+        let activation = ProfileActivationContext::new(
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            BTreeMap::from([("environment".to_string(), "dev".to_string())]),
+            None,
+            dir.path().to_path_buf(),
+        );
+        let resolver = Resolver::new_with_activation(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            activation,
+            true,
+            false,
+        )
+        .unwrap();
+        let resolved = resolver
+            .resolve(vec![DeclaredDependency {
+                alias: "root".to_string(),
+                artifact: ArtifactCoordinate::jar(root),
+                scope: Scope::Compile,
+                exclusions: Vec::new(),
+            }])
+            .unwrap();
+
+        assert!(
+            resolved
+                .iter()
+                .any(|artifact| artifact.artifact.coordinate.artifact == "profile-child")
+        );
+    }
+
+    #[test]
+    fn uses_matching_local_parent_relative_path() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("m2");
+        let root = Coordinate::new("com.example", "root", "1.0.0");
+        let child = Coordinate::new("com.example", "child", "2.0.0");
+        let root_dir = root.local_dir(&repo);
+
+        fs::create_dir_all(&root_dir).unwrap();
+        fs::write(
+            root_dir.join("parent.xml"),
+            r#"
+            <project>
+              <groupId>com.example</groupId>
+              <artifactId>parent</artifactId>
+              <version>1.0.0</version>
+              <properties>
+                <child.version>2.0.0</child.version>
+              </properties>
+            </project>
+            "#,
+        )
+        .unwrap();
+        fs::write(root.jar_path(&repo), "jar for root").unwrap();
+        fs::write(
+            root.pom_path(&repo),
+            r#"
+            <project>
+              <parent>
+                <groupId>com.example</groupId>
+                <artifactId>parent</artifactId>
+                <version>1.0.0</version>
+                <relativePath>parent.xml</relativePath>
+              </parent>
+              <artifactId>root</artifactId>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>child</artifactId>
+                  <version>${child.version}</version>
+                </dependency>
+              </dependencies>
+            </project>
+            "#,
+        )
+        .unwrap();
+        write_artifact(&repo, &child, "<project/>");
+
+        let resolver = Resolver::new(
+            repo,
+            vec![Repository::maven_central()],
+            MavenSettings::default(),
+            true,
+            false,
+        )
+        .unwrap();
+        let resolved = resolver
+            .resolve(vec![DeclaredDependency {
+                alias: "root".to_string(),
+                artifact: ArtifactCoordinate::jar(root),
+                scope: Scope::Compile,
+                exclusions: Vec::new(),
+            }])
+            .unwrap();
+
+        assert!(
+            resolved
+                .iter()
+                .any(|artifact| artifact.artifact.coordinate.to_string()
+                    == "com.example:child:2.0.0")
+        );
     }
 }
