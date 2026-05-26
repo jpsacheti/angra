@@ -3,13 +3,20 @@ use std::{collections::BTreeMap, fs, path::Path};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::maven::{ArtifactCoordinate, ArtifactType, Coordinate, Repository, Scope};
+use crate::maven::{
+    ArtifactCoordinate, ArtifactType, ChecksumPolicy, Coordinate, Repository, RepositoryPolicy,
+    Scope,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
     pub project: Option<Project>,
     #[serde(default)]
-    pub repositories: IndexMap<String, String>,
+    pub resolver: ResolverConfig,
+    #[serde(default)]
+    pub repositories: IndexMap<String, RepositorySpec>,
+    #[serde(default, rename = "dependency-management")]
+    pub dependency_management: BTreeMap<String, ManagedDependencySpec>,
     #[serde(default)]
     pub dependencies: BTreeMap<String, DependencySpec>,
 }
@@ -19,6 +26,25 @@ pub struct Project {
     pub group: Option<String>,
     pub artifact: Option<String>,
     pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResolverConfig {
+    #[serde(default)]
+    pub maven: MavenResolverConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MavenResolverConfig {
+    #[serde(default)]
+    pub active_profiles: Vec<String>,
+    #[serde(default)]
+    pub inactive_profiles: Vec<String>,
+    #[serde(default)]
+    pub java_version: Option<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,11 +69,111 @@ pub struct StructuredDependency {
     pub exclusions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ManagedDependencySpec {
+    Compact(String),
+    Structured(StructuredManagedDependency),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct StructuredManagedDependency {
+    pub group: String,
+    pub artifact: String,
+    pub version: String,
+    #[serde(default, rename = "type")]
+    pub artifact_type: ArtifactType,
+    #[serde(default)]
+    pub classifier: Option<String>,
+    #[serde(default)]
+    pub scope: ManagedDependencyScope,
+    #[serde(default)]
+    pub exclusions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ManagedDependencyScope {
+    #[default]
+    None,
+    Graph(Scope),
+    Import,
+}
+
+impl<'de> Deserialize<'de> for ManagedDependencyScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            match Option::<String>::deserialize(deserializer)?.as_deref() {
+                None | Some("") => Self::None,
+                Some("compile") => Self::Graph(Scope::Compile),
+                Some("runtime") => Self::Graph(Scope::Runtime),
+                Some("test") => Self::Graph(Scope::Test),
+                Some("provided") => Self::Graph(Scope::Provided),
+                Some("import") => Self::Import,
+                Some(scope) => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported dependency-management scope `{scope}`"
+                    )));
+                }
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RepositorySpec {
+    Compact(String),
+    Structured(StructuredRepository),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct StructuredRepository {
+    pub url: String,
+    #[serde(default)]
+    pub releases: Option<bool>,
+    #[serde(default)]
+    pub snapshots: Option<bool>,
+    #[serde(default)]
+    pub checksum_policy: Option<String>,
+}
+
+impl RepositorySpec {
+    pub fn to_repository(&self, name: &str) -> Repository {
+        match self {
+            Self::Compact(url) => Repository::new(name, url),
+            Self::Structured(repository) => {
+                let releases = RepositoryPolicy {
+                    enabled: repository.releases.unwrap_or(true),
+                    checksum_policy: ChecksumPolicy::parse(repository.checksum_policy.as_deref()),
+                };
+                let snapshots = RepositoryPolicy {
+                    enabled: repository.snapshots.unwrap_or(true),
+                    checksum_policy: ChecksumPolicy::parse(repository.checksum_policy.as_deref()),
+                };
+                Repository::with_policy_details(name, &repository.url, releases, snapshots)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredDependency {
     pub alias: String,
     pub artifact: ArtifactCoordinate,
     pub scope: Scope,
+    pub exclusions: Vec<Coordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredManagedDependency {
+    pub alias: String,
+    pub artifact: ArtifactCoordinate,
+    pub scope: ManagedDependencyScope,
     pub exclusions: Vec<Coordinate>,
 }
 
@@ -96,6 +222,47 @@ impl Manifest {
             .collect()
     }
 
+    pub fn declared_dependency_management(
+        &self,
+    ) -> Result<Vec<DeclaredManagedDependency>, ManifestError> {
+        self.dependency_management
+            .iter()
+            .map(|(alias, spec)| {
+                let (artifact, scope, exclusions) = match spec {
+                    ManagedDependencySpec::Compact(raw) => (
+                        ArtifactCoordinate::jar(raw.parse()?),
+                        ManagedDependencyScope::None,
+                        Vec::new(),
+                    ),
+                    ManagedDependencySpec::Structured(dep) => {
+                        let exclusions = dep
+                            .exclusions
+                            .iter()
+                            .map(|exclusion| Coordinate::parse_without_version(exclusion))
+                            .collect::<Result<Vec<_>, _>>()?;
+
+                        (
+                            ArtifactCoordinate::new(
+                                Coordinate::new(&dep.group, &dep.artifact, &dep.version),
+                                dep.artifact_type,
+                                dep.classifier.clone(),
+                            ),
+                            dep.scope,
+                            exclusions,
+                        )
+                    }
+                };
+
+                Ok(DeclaredManagedDependency {
+                    alias: alias.clone(),
+                    artifact,
+                    scope,
+                    exclusions,
+                })
+            })
+            .collect()
+    }
+
     /// Return repositories with global config and Maven settings merged in.
     ///
     /// Precedence by name: project repos override global repos, which override settings repos.
@@ -112,8 +279,8 @@ impl Manifest {
         }
 
         let mut merged = global.to_vec();
-        for (name, url) in &self.repositories {
-            let repository = Repository::new(name, url);
+        for (name, spec) in &self.repositories {
+            let repository = spec.to_repository(name);
             if let Some(existing) = merged
                 .iter_mut()
                 .find(|existing| existing.name == repository.name)
@@ -157,6 +324,10 @@ mod tests {
             r#"
             [repositories]
             central = "https://repo1.maven.org/maven2/"
+            snapshots = { url = "https://snapshots.example.com/maven/", releases = false, snapshots = true, checksum-policy = "ignore" }
+
+            [dependency-management]
+            spring = { group = "org.springframework.boot", artifact = "spring-boot-dependencies", version = "4.0.6", type = "pom", scope = "import" }
 
             [dependencies]
             guava = "com.google.guava:guava:33.0.0-jre"
@@ -164,6 +335,12 @@ mod tests {
             "#,
         )
         .unwrap();
+
+        let management = manifest.declared_dependency_management().unwrap();
+        assert_eq!(management.len(), 1);
+        assert_eq!(management[0].alias, "spring");
+        assert_eq!(management[0].artifact.artifact_type, ArtifactType::Pom);
+        assert_eq!(management[0].scope, ManagedDependencyScope::Import);
 
         let dependencies = manifest.declared_dependencies().unwrap();
 
@@ -180,9 +357,16 @@ mod tests {
         assert_eq!(dependencies[1].exclusions[0].group, "com.foo");
 
         let repositories = manifest.declared_repositories(&[], &[]);
-        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories.len(), 2);
         assert_eq!(repositories[0].name, "central");
         assert_eq!(repositories[0].url, "https://repo1.maven.org/maven2");
+        assert_eq!(repositories[1].name, "snapshots");
+        assert!(!repositories[1].releases.enabled);
+        assert!(repositories[1].snapshots.enabled);
+        assert_eq!(
+            repositories[1].snapshots.checksum_policy,
+            ChecksumPolicy::Ignore
+        );
     }
 
     #[test]
