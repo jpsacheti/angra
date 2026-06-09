@@ -1,18 +1,21 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
+use quick_xml::{Reader, escape::unescape, events::Event};
+
 use serde::Deserialize;
 
-use crate::maven::Repository;
+use crate::maven::{ChecksumPolicy, Repository, RepositoryPolicy};
 
 #[derive(Debug, Default, Clone)]
 pub struct MavenSettings {
     pub local_repository: Option<PathBuf>,
     pub repositories: Vec<Repository>,
     pub mirrors: Vec<Mirror>,
+    pub properties: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +65,11 @@ impl MavenSettings {
     }
 
     pub fn parse(raw: &str) -> Result<Self, SettingsError> {
-        let parsed: RawSettings = quick_xml::de::from_str(raw)?;
+        let mut parsed: RawSettings = quick_xml::de::from_str(raw)?;
+        let profile_properties = read_profile_properties(raw)?;
+        for (profile, properties) in parsed.profiles.profile.iter_mut().zip(profile_properties) {
+            profile.properties = properties;
+        }
 
         let mut active_ids: HashSet<&str> = parsed
             .active_profiles
@@ -72,6 +79,7 @@ impl MavenSettings {
             .collect();
 
         let mut repositories = Vec::new();
+        let mut properties = BTreeMap::new();
         let mut seen = HashSet::new();
         for profile in &parsed.profiles.profile {
             let profile_id = profile.id.as_deref().unwrap_or("").trim();
@@ -86,6 +94,8 @@ impl MavenSettings {
                 continue;
             }
 
+            properties.extend(profile.properties.clone());
+
             for repository in &profile.repositories.repository {
                 let Some(id) = repository.id.as_deref().map(str::trim) else {
                     continue;
@@ -96,23 +106,18 @@ impl MavenSettings {
                 if id.is_empty() || url.is_empty() || !seen.insert(id.to_string()) {
                     continue;
                 }
-                let releases_enabled = repository
+                let releases = repository
                     .releases
                     .as_ref()
-                    .and_then(|p| p.enabled.as_deref())
-                    .map(|v| !v.trim().eq_ignore_ascii_case("false"))
-                    .unwrap_or(true);
-                let snapshots_enabled = repository
+                    .map(RawRepositoryPolicy::to_repository_policy)
+                    .unwrap_or_default();
+                let snapshots = repository
                     .snapshots
                     .as_ref()
-                    .and_then(|p| p.enabled.as_deref())
-                    .map(|v| !v.trim().eq_ignore_ascii_case("false"))
-                    .unwrap_or(true);
-                repositories.push(Repository::with_policies(
-                    id,
-                    url,
-                    releases_enabled,
-                    snapshots_enabled,
+                    .map(RawRepositoryPolicy::to_repository_policy)
+                    .unwrap_or_default();
+                repositories.push(Repository::with_policy_details(
+                    id, url, releases, snapshots,
                 ));
             }
         }
@@ -153,6 +158,7 @@ impl MavenSettings {
             local_repository,
             repositories,
             mirrors,
+            properties,
         })
     }
 
@@ -186,6 +192,12 @@ pub enum SettingsError {
     Io(#[from] std::io::Error),
     #[error("failed to parse Maven settings XML: {0}")]
     Xml(#[from] quick_xml::DeError),
+    #[error("failed to read Maven settings XML: {0}")]
+    XmlRead(#[from] quick_xml::Error),
+    #[error("failed to decode Maven settings XML: {0}")]
+    XmlDecode(#[from] quick_xml::encoding::EncodingError),
+    #[error("failed to unescape Maven settings XML: {0}")]
+    XmlEscape(#[from] quick_xml::escape::EscapeError),
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -218,6 +230,8 @@ struct Profiles {
 struct Profile {
     id: Option<String>,
     activation: Option<Activation>,
+    #[serde(skip)]
+    properties: BTreeMap<String, String>,
     #[serde(default)]
     repositories: ProfileRepositories,
 }
@@ -236,8 +250,23 @@ struct ProfileRepositories {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawRepositoryPolicy {
     enabled: Option<String>,
+    checksum_policy: Option<String>,
+}
+
+impl RawRepositoryPolicy {
+    fn to_repository_policy(&self) -> RepositoryPolicy {
+        RepositoryPolicy {
+            enabled: self
+                .enabled
+                .as_deref()
+                .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
+            checksum_policy: ChecksumPolicy::parse(self.checksum_policy.as_deref()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +277,94 @@ struct ProfileRepository {
     releases: Option<RawRepositoryPolicy>,
     #[serde(default)]
     snapshots: Option<RawRepositoryPolicy>,
+}
+
+fn read_profile_properties(raw: &str) -> Result<Vec<BTreeMap<String, String>>, SettingsError> {
+    let mut reader = Reader::from_str(raw);
+    reader.config_mut().trim_text(true);
+
+    let mut stack = Vec::<String>::new();
+    let mut profile_index = None::<usize>;
+    let mut seen_profiles = 0usize;
+    let mut profiles = Vec::<BTreeMap<String, String>>::new();
+    let mut in_properties = false;
+    let mut properties_depth = 0usize;
+    let mut current_property = None::<String>;
+    let mut current_value = String::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) => {
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                if name == "profile" && stack_is(&stack, &["settings", "profiles"]) {
+                    profile_index = Some(seen_profiles);
+                    seen_profiles += 1;
+                    profiles.push(BTreeMap::new());
+                }
+
+                if !in_properties
+                    && name == "properties"
+                    && profile_index.is_some()
+                    && stack_is(&stack, &["settings", "profiles", "profile"])
+                {
+                    in_properties = true;
+                } else if in_properties {
+                    properties_depth += 1;
+                    if properties_depth == 1 && current_property.is_none() {
+                        current_property = Some(name.clone());
+                        current_value.clear();
+                    }
+                }
+                stack.push(name);
+            }
+            Event::Text(text) if current_property.is_some() => {
+                let decoded = text.decode()?;
+                current_value.push_str(&unescape(&decoded)?);
+            }
+            Event::CData(text) if current_property.is_some() => {
+                current_value.push_str(&text.decode()?);
+            }
+            Event::End(element)
+                if in_properties
+                    && properties_depth == 0
+                    && element.local_name().as_ref() == b"properties" =>
+            {
+                in_properties = false;
+                stack.pop();
+            }
+            Event::End(_) if in_properties => {
+                if properties_depth == 1
+                    && let (Some(index), Some(property)) = (profile_index, current_property.take())
+                    && let Some(properties) = profiles.get_mut(index)
+                {
+                    properties.insert(property, current_value.trim().to_string());
+                    current_value.clear();
+                }
+                properties_depth = properties_depth.saturating_sub(1);
+                stack.pop();
+            }
+            Event::End(element) => {
+                if element.local_name().as_ref() == b"profile"
+                    && stack_is(&stack, &["settings", "profiles", "profile"])
+                {
+                    profile_index = None;
+                }
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(profiles)
+}
+
+fn stack_is(stack: &[String], expected: &[&str]) -> bool {
+    stack.len() == expected.len()
+        && stack
+            .iter()
+            .zip(expected)
+            .all(|(left, right)| left == right)
 }
 
 #[derive(Debug, Default, Deserialize)]

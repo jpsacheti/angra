@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -7,7 +7,8 @@ use std::{
 use quick_xml::{Reader, escape::unescape, events::Event};
 
 use crate::maven::{
-    ArtifactCoordinate, ArtifactIdentity, ArtifactType, Coordinate, Repository, Scope,
+    ArtifactCoordinate, ArtifactIdentity, ArtifactType, ChecksumPolicy, Coordinate, Repository,
+    RepositoryPolicy, Scope,
 };
 
 #[derive(Debug, Clone)]
@@ -46,9 +47,12 @@ pub(crate) struct PomRepositories {
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PomRepositoryPolicy {
     #[serde(default)]
     pub(crate) enabled: Option<String>,
+    #[serde(default)]
+    pub(crate) checksum_policy: Option<String>,
 }
 
 impl PomRepositoryPolicy {
@@ -57,6 +61,13 @@ impl PomRepositoryPolicy {
             .as_deref()
             .map(|v| !v.trim().eq_ignore_ascii_case("false"))
             .unwrap_or(true)
+    }
+
+    fn to_repository_policy(&self) -> RepositoryPolicy {
+        RepositoryPolicy {
+            enabled: self.is_enabled(),
+            checksum_policy: ChecksumPolicy::parse(self.checksum_policy.as_deref()),
+        }
     }
 }
 
@@ -86,18 +97,23 @@ impl PomRepository {
             Some(id) => properties.interpolate(id, source)?,
             None => url.clone(),
         };
-        let releases_enabled = self.releases.as_ref().is_none_or(|p| p.is_enabled());
-        let snapshots_enabled = self.snapshots.as_ref().is_none_or(|p| p.is_enabled());
-        Ok(Some(Repository::with_policies(
-            &id,
-            &url,
-            releases_enabled,
-            snapshots_enabled,
+        let releases = self
+            .releases
+            .as_ref()
+            .map(PomRepositoryPolicy::to_repository_policy)
+            .unwrap_or_default();
+        let snapshots = self
+            .snapshots
+            .as_ref()
+            .map(PomRepositoryPolicy::to_repository_policy)
+            .unwrap_or_default();
+        Ok(Some(Repository::with_policy_details(
+            &id, &url, releases, snapshots,
         )))
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename = "project")]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Pom {
@@ -113,13 +129,19 @@ pub(crate) struct Pom {
     dependencies: PomDependencies,
     #[serde(default)]
     repositories: PomRepositories,
+    #[serde(default)]
+    profiles: PomProfiles,
 }
 
 impl Pom {
     pub(crate) fn read(path: &Path) -> Result<Self, PomError> {
         let raw = fs::read_to_string(path)?;
         let mut pom: Self = quick_xml::de::from_str(&raw)?;
-        pom.properties = read_pom_properties(&raw)?;
+        let (project_props, profile_props_list) = read_all_properties(&raw)?;
+        pom.properties = project_props;
+        for (profile, properties) in pom.profiles.profile.iter_mut().zip(profile_props_list) {
+            profile.properties = properties;
+        }
         Ok(pom)
     }
 
@@ -141,7 +163,21 @@ impl Pom {
         parent.coordinate(&context, source)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn effective_without_parent(&self) -> EffectivePom {
+        self.effective_without_parent_with_context(&ProfileActivationContext::default())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn effective_without_parent_with_context(
+        &self,
+        activation: &ProfileActivationContext,
+    ) -> EffectivePom {
+        let model = self.active_model(activation);
+        model.effective_without_parent_inner()
+    }
+
+    fn effective_without_parent_inner(&self) -> EffectivePom {
         let context = self.property_context();
         let mut repositories = Vec::new();
         for repo in &self.repositories.repositories {
@@ -162,10 +198,24 @@ impl Pom {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn merge_with_parent(&self, parent: Option<EffectivePom>) -> EffectivePom {
+        self.merge_with_parent_with_context(parent, &ProfileActivationContext::default())
+    }
+
+    pub(crate) fn merge_with_parent_with_context(
+        &self,
+        parent: Option<EffectivePom>,
+        activation: &ProfileActivationContext,
+    ) -> EffectivePom {
+        let model = self.active_model(activation);
+        model.merge_with_parent_inner(parent)
+    }
+
+    fn merge_with_parent_inner(&self, parent: Option<EffectivePom>) -> EffectivePom {
         let mut effective = match parent {
             Some(parent_effective) => parent_effective,
-            None => return self.effective_without_parent(),
+            None => return self.effective_without_parent_inner(),
         };
 
         effective.group_id = self.group_id.clone().or(effective.group_id);
@@ -204,9 +254,76 @@ impl Pom {
     pub(crate) fn dependency_management_entries(&self) -> &[PomDependency] {
         &self.dependency_management.dependencies.dependencies
     }
+
+    pub(crate) fn relative_parent_path(&self) -> Option<Option<&Path>> {
+        self.parent
+            .as_ref()
+            .map(|parent| parent.relative_path.as_deref())
+    }
+
+    pub(crate) fn active_model(&self, activation: &ProfileActivationContext) -> Self {
+        let mut model = self.clone();
+        model.profiles = PomProfiles::default();
+
+        let active_profiles = self.active_profiles(activation);
+        for profile in active_profiles {
+            model.properties.extend(profile.properties.clone());
+            model
+                .dependency_management
+                .dependencies
+                .dependencies
+                .extend(
+                    profile
+                        .dependency_management
+                        .dependencies
+                        .dependencies
+                        .clone(),
+                );
+            model
+                .dependencies
+                .dependencies
+                .extend(profile.dependencies.dependencies.clone());
+            model
+                .repositories
+                .repositories
+                .extend(profile.repositories.repositories.clone());
+        }
+
+        model
+    }
+
+    fn active_profiles(&self, activation: &ProfileActivationContext) -> Vec<&PomProfile> {
+        let mut active = Vec::new();
+        let mut defaults = Vec::new();
+        let mut has_non_default_active = false;
+
+        for profile in &self.profiles.profile {
+            let id = profile.id.as_deref().unwrap_or_default();
+            if activation.inactive_profiles.contains(id) {
+                continue;
+            }
+
+            if activation.active_profiles.contains(id) || profile.is_active(activation, self) {
+                has_non_default_active = true;
+                active.push(profile);
+            } else if profile
+                .activation
+                .as_ref()
+                .is_some_and(|activation| activation.active_by_default)
+            {
+                defaults.push(profile);
+            }
+        }
+
+        if !has_non_default_active {
+            active.extend(defaults);
+        }
+
+        active
+    }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PomParent {
     group_id: Option<String>,
@@ -214,6 +331,282 @@ struct PomParent {
     version: Option<String>,
     #[allow(dead_code)]
     relative_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProfileActivationContext {
+    pub(crate) active_profiles: HashSet<String>,
+    pub(crate) inactive_profiles: HashSet<String>,
+    pub(crate) properties: BTreeMap<String, String>,
+    pub(crate) java_version: Option<String>,
+    pub(crate) project_dir: Option<PathBuf>,
+    pub(crate) os_name: String,
+    pub(crate) os_arch: String,
+    pub(crate) os_version: String,
+}
+
+impl ProfileActivationContext {
+    pub(crate) fn new(
+        active_profiles: impl IntoIterator<Item = String>,
+        inactive_profiles: impl IntoIterator<Item = String>,
+        properties: BTreeMap<String, String>,
+        java_version: Option<String>,
+        project_dir: PathBuf,
+    ) -> Self {
+        let java_version = java_version.or_else(read_java_home_version);
+        let mut properties = properties;
+        properties.extend(std::env::vars().map(|(name, value)| (format!("env.{name}"), value)));
+
+        Self {
+            active_profiles: active_profiles.into_iter().collect(),
+            inactive_profiles: inactive_profiles.into_iter().collect(),
+            properties,
+            java_version,
+            project_dir: Some(project_dir),
+            os_name: std::env::consts::OS.to_string(),
+            os_arch: std::env::consts::ARCH.to_string(),
+            os_version: String::new(),
+        }
+    }
+}
+
+fn read_java_home_version() -> Option<String> {
+    let java_home = std::env::var_os("JAVA_HOME")?;
+    let release = fs::read_to_string(PathBuf::from(java_home).join("release")).ok()?;
+    release.lines().find_map(|line| {
+        let value = line.strip_prefix("JAVA_VERSION=")?;
+        Some(value.trim_matches('"').to_string())
+    })
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct PomProfiles {
+    #[serde(rename = "profile", default)]
+    profile: Vec<PomProfile>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PomProfile {
+    id: Option<String>,
+    activation: Option<PomActivation>,
+    #[serde(skip)]
+    properties: BTreeMap<String, String>,
+    #[serde(default)]
+    dependency_management: PomDependencyManagement,
+    #[serde(default)]
+    dependencies: PomDependencies,
+    #[serde(default)]
+    repositories: PomRepositories,
+}
+
+impl PomProfile {
+    fn is_active(&self, context: &ProfileActivationContext, pom: &Pom) -> bool {
+        let Some(activation) = &self.activation else {
+            return false;
+        };
+        activation.is_active(context, pom)
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PomActivation {
+    #[serde(default)]
+    active_by_default: bool,
+    jdk: Option<String>,
+    os: Option<PomActivationOs>,
+    property: Option<PomActivationProperty>,
+    file: Option<PomActivationFile>,
+}
+
+impl PomActivation {
+    fn is_active(&self, context: &ProfileActivationContext, pom: &Pom) -> bool {
+        let mut configured = false;
+
+        if let Some(jdk) = &self.jdk {
+            configured = true;
+            if !matches_jdk(jdk, context.java_version.as_deref().unwrap_or_default()) {
+                return false;
+            }
+        }
+        if let Some(os) = &self.os {
+            configured = true;
+            if !os.matches(context) {
+                return false;
+            }
+        }
+        if let Some(property) = &self.property {
+            configured = true;
+            if !property.matches(context, pom) {
+                return false;
+            }
+        }
+        if let Some(file) = &self.file {
+            configured = true;
+            if !file.matches(context) {
+                return false;
+            }
+        }
+
+        configured
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct PomActivationOs {
+    name: Option<String>,
+    family: Option<String>,
+    arch: Option<String>,
+    version: Option<String>,
+}
+
+impl PomActivationOs {
+    fn matches(&self, context: &ProfileActivationContext) -> bool {
+        let mut configured = false;
+        if let Some(family) = &self.family {
+            configured = true;
+            if !matches_negatable(family, &os_family(&context.os_name)) {
+                return false;
+            }
+        }
+        if let Some(name) = &self.name {
+            configured = true;
+            if !matches_negatable(name, &context.os_name) {
+                return false;
+            }
+        }
+        if let Some(arch) = &self.arch {
+            configured = true;
+            if !matches_negatable(arch, &context.os_arch) {
+                return false;
+            }
+        }
+        if let Some(version) = &self.version {
+            configured = true;
+            if !matches_negatable(version, &context.os_version) {
+                return false;
+            }
+        }
+        configured
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct PomActivationProperty {
+    name: Option<String>,
+    value: Option<String>,
+}
+
+impl PomActivationProperty {
+    fn matches(&self, context: &ProfileActivationContext, pom: &Pom) -> bool {
+        let Some(raw_name) = &self.name else {
+            return false;
+        };
+        let reverse_name = raw_name.starts_with('!');
+        let name = raw_name.strip_prefix('!').unwrap_or(raw_name);
+        if name.is_empty() {
+            return false;
+        }
+
+        let value = if name == "packaging" {
+            Some("jar")
+        } else {
+            context.properties.get(name).map(String::as_str)
+        };
+
+        let Some(expected) = &self.value else {
+            let present = value.is_some_and(|value| !value.is_empty());
+            return if reverse_name { !present } else { present };
+        };
+
+        let expected = interpolate_activation_value(expected, context, pom);
+        let reverse_value = expected.starts_with('!');
+        let expected = expected.strip_prefix('!').unwrap_or(&expected);
+        let matches = value == Some(expected);
+        if reverse_value { !matches } else { matches }
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct PomActivationFile {
+    exists: Option<String>,
+    missing: Option<String>,
+}
+
+impl PomActivationFile {
+    fn matches(&self, context: &ProfileActivationContext) -> bool {
+        let (raw_path, missing) = match (&self.exists, &self.missing) {
+            (Some(path), _) if !path.trim().is_empty() => (path, false),
+            (_, Some(path)) if !path.trim().is_empty() => (path, true),
+            _ => return false,
+        };
+        let path = interpolate_activation_file(raw_path, context);
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else if let Some(project_dir) = &context.project_dir {
+            project_dir.join(path)
+        } else {
+            return false;
+        };
+        let exists = path.exists();
+        if missing { !exists } else { exists }
+    }
+}
+
+fn matches_negatable(expected: &str, actual: &str) -> bool {
+    let reverse = expected.starts_with('!');
+    let expected = expected.strip_prefix('!').unwrap_or(expected);
+    let matches = actual.eq_ignore_ascii_case(expected);
+    if reverse { !matches } else { matches }
+}
+
+fn os_family(os_name: &str) -> String {
+    match os_name.to_ascii_lowercase().as_str() {
+        "macos" | "darwin" => "mac".to_string(),
+        "windows" => "windows".to_string(),
+        "linux" | "freebsd" | "openbsd" | "netbsd" => "unix".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn matches_jdk(expected: &str, actual: &str) -> bool {
+    if actual.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = expected.strip_prefix('!') {
+        return !actual.starts_with(prefix);
+    }
+    if expected.starts_with(['[', '('])
+        && let Ok(range) = crate::maven::VersionRange::parse(expected)
+    {
+        return range.contains(actual);
+    }
+    actual.starts_with(expected)
+}
+
+fn interpolate_activation_value(
+    value: &str,
+    context: &ProfileActivationContext,
+    pom: &Pom,
+) -> String {
+    let mut values = context.properties.clone();
+    values.extend(pom.properties.clone());
+    PomPropertyContext::new(values, None, None, None)
+        .interpolate(value, "profile activation")
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn interpolate_activation_file(value: &str, context: &ProfileActivationContext) -> String {
+    let mut output = value.to_string();
+    if let Some(project_dir) = &context.project_dir {
+        output = output.replace("${project.basedir}", &project_dir.display().to_string());
+    }
+    for (key, property_value) in &context.properties {
+        output = output.replace(&format!("${{{key}}}"), property_value);
+    }
+    output
 }
 
 impl PomParent {
@@ -324,11 +717,19 @@ impl PomPropertyContext {
     }
 }
 
-fn read_pom_properties(raw: &str) -> Result<BTreeMap<String, String>, PomError> {
+#[allow(clippy::type_complexity)]
+fn read_all_properties(
+    raw: &str,
+) -> Result<(BTreeMap<String, String>, Vec<BTreeMap<String, String>>), PomError> {
     let mut reader = Reader::from_str(raw);
     reader.config_mut().trim_text(true);
 
-    let mut values = BTreeMap::new();
+    let mut project_properties = BTreeMap::new();
+    let mut profile_properties_list = Vec::new();
+
+    let mut stack = Vec::<String>::new();
+    let mut current_profile_index = None::<usize>;
+    let mut seen_profiles = 0usize;
     let mut in_properties = false;
     let mut properties_depth = 0usize;
     let mut current_property = None;
@@ -336,24 +737,39 @@ fn read_pom_properties(raw: &str) -> Result<BTreeMap<String, String>, PomError> 
 
     loop {
         match reader.read_event()? {
-            Event::Start(element)
-                if !in_properties && element.local_name().as_ref() == b"properties" =>
-            {
-                in_properties = true;
-            }
-            Event::Start(element) if in_properties => {
-                properties_depth += 1;
-                if properties_depth == 1 && current_property.is_none() {
-                    current_property =
-                        Some(String::from_utf8_lossy(element.local_name().as_ref()).into_owned());
-                    current_value.clear();
+            Event::Start(element) => {
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                if name == "profile" && stack_is(&stack, &["project", "profiles"]) {
+                    current_profile_index = Some(seen_profiles);
+                    seen_profiles += 1;
+                    profile_properties_list.push(BTreeMap::new());
                 }
+
+                if !in_properties && name == "properties" {
+                    let is_project = stack_is(&stack, &["project"]);
+                    let is_profile = current_profile_index.is_some()
+                        && stack_is(&stack, &["project", "profiles", "profile"]);
+                    if is_project || is_profile {
+                        in_properties = true;
+                    }
+                } else if in_properties {
+                    properties_depth += 1;
+                    if properties_depth == 1 && current_property.is_none() {
+                        current_property = Some(name.clone());
+                        current_value.clear();
+                    }
+                }
+                stack.push(name);
             }
             Event::Empty(element) if in_properties && properties_depth == 0 => {
-                values.insert(
-                    String::from_utf8_lossy(element.local_name().as_ref()).into_owned(),
-                    String::new(),
-                );
+                let key = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                if let Some(idx) = current_profile_index {
+                    if let Some(profile_map) = profile_properties_list.get_mut(idx) {
+                        profile_map.insert(key, String::new());
+                    }
+                } else {
+                    project_properties.insert(key, String::new());
+                }
             }
             Event::Text(text) if current_property.is_some() => {
                 let decoded = text.decode()?;
@@ -368,31 +784,56 @@ fn read_pom_properties(raw: &str) -> Result<BTreeMap<String, String>, PomError> 
                     && element.local_name().as_ref() == b"properties" =>
             {
                 in_properties = false;
+                stack.pop();
             }
             Event::End(_) if in_properties => {
                 if properties_depth == 1
                     && let Some(property) = current_property.take()
                 {
-                    values.insert(property, current_value.trim().to_string());
+                    let val = current_value.trim().to_string();
+                    if let Some(idx) = current_profile_index {
+                        if let Some(profile_map) = profile_properties_list.get_mut(idx) {
+                            profile_map.insert(property, val);
+                        }
+                    } else {
+                        project_properties.insert(property, val);
+                    }
                     current_value.clear();
                 }
                 properties_depth = properties_depth.saturating_sub(1);
+                stack.pop();
+            }
+            Event::End(element) => {
+                if element.local_name().as_ref() == b"profile"
+                    && stack_is(&stack, &["project", "profiles", "profile"])
+                {
+                    current_profile_index = None;
+                }
+                stack.pop();
             }
             Event::Eof => break,
             _ => {}
         }
     }
 
-    Ok(values)
+    Ok((project_properties, profile_properties_list))
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+fn stack_is(stack: &[String], expected: &[&str]) -> bool {
+    stack.len() == expected.len()
+        && stack
+            .iter()
+            .zip(expected)
+            .all(|(left, right)| left == right)
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 struct PomDependencyManagement {
     #[serde(default)]
     dependencies: PomDependencies,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub(crate) struct PomDependencies {
     #[serde(rename = "dependency", default)]
     dependencies: Vec<PomDependency>,
@@ -475,8 +916,11 @@ impl PomDependency {
         properties: &PomPropertyContext,
         source: &str,
     ) -> Result<Option<(ArtifactIdentity, ManagedDependency)>, PomError> {
-        let Some(artifact) = self.artifact_without_version(properties, source)? else {
-            return Ok(None);
+        let artifact = match self.artifact_without_version(properties, source) {
+            Ok(Some(artifact)) => artifact,
+            Ok(None) => return Ok(None),
+            Err(PomError::UnsupportedArtifactType { .. }) => return Ok(None),
+            Err(error) => return Err(error),
         };
         let identity = artifact.identity();
 
@@ -883,6 +1327,34 @@ mod tests {
             resolved.artifact.to_string(),
             "com.example:native:jar:linux-aarch64:1.0.0"
         );
+    }
+
+    #[test]
+    fn ignores_unsupported_dependency_types_in_management_only() {
+        let dependency = PomDependency {
+            group_id: Some("com.example".to_string()),
+            artifact_id: Some("native".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependency_type: Some("klib".to_string()),
+            ..Default::default()
+        };
+        let properties = PomPropertyContext::from_values(BTreeMap::new());
+
+        let managed = dependency
+            .managed_dependency(&properties, "com.example:root:1.0.0")
+            .unwrap();
+        assert!(managed.is_none());
+
+        let direct = dependency
+            .resolve(&properties, "com.example:root:1.0.0", &BTreeMap::new())
+            .unwrap_err();
+        assert!(matches!(
+            direct,
+            PomError::UnsupportedArtifactType {
+                artifact_type,
+                ..
+            } if artifact_type == "klib"
+        ));
     }
 
     #[test]

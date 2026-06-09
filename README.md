@@ -35,10 +35,15 @@ Angra is very early. The current MVP focuses on dependency resolution.
 - Runtime dependency graph resolution for compile/runtime scopes
 - Current-POM and inherited parent property interpolation
 - Parent POM inheritance for repository-resolved parents
+- Local parent POM lookup through `<relativePath>` before repository fallback
 - Dependency management and BOM imports
+- Angra-native `[dependency-management]` BOM imports and managed versions
+- Maven profile activation and injection for resolver-relevant POM sections
+- Maven version ranges resolved from `maven-metadata.xml`
+- Timestamped SNAPSHOT resolution from Maven metadata
 - `jar`, `pom`, and `war` dependency artifact types
 - Optional classifiers in structured dependencies and transitive POM dependencies
-- SHA-1 checksum verification for Maven Central downloads
+- SHA-1 checksum verification with repository `checksumPolicy` support
 - Parallel same-depth artifact fetching during resolution
 - Optional dependency filtering
 - Exclusions
@@ -70,10 +75,26 @@ version = "0.1.0"
 
 [repositories]
 central = "https://repo1.maven.org/maven2"
+snapshots = { url = "https://repo.example.com/snapshots", releases = false, snapshots = true, checksum-policy = "warn" }
+
+[dependency-management]
+spring = { group = "org.springframework.boot", artifact = "spring-boot-dependencies", version = "4.0.6", type = "pom", scope = "import" }
 
 [dependencies]
 slf4j = "org.slf4j:slf4j-api:2.0.13"
 guava = { group = "com.google.guava", artifact = "guava", version = "33.0.0-jre" }
+```
+
+Optional Maven profile controls:
+
+```toml
+[resolver.maven]
+active-profiles = ["dev"]
+inactive-profiles = ["legacy"]
+java-version = "21.0.2"
+
+[resolver.maven.properties]
+environment = "test"
 ```
 
 Resolve dependencies:
@@ -122,12 +143,9 @@ The MVP intentionally does not support every Maven feature yet. In particular:
 
 - `pom.xml` ingestion as a project manifest
 - Private repositories
-- Mirrors
 - Authentication
 - Unknown Maven artifact types beyond `jar`, `pom`, and `war`
-- Version ranges
-- Maven profiles
-- Local parent lookup through `<relativePath>`
+- The long tail of Maven profile/plugin/build-model behavior outside resolver-relevant dependencies, dependency management, properties, and repositories
 
 Unsupported runtime dependency properties fail clearly instead of being guessed.
 

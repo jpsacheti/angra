@@ -80,6 +80,18 @@ fn write_remote_file(path: &std::path::Path, bytes: &[u8]) {
     .unwrap();
 }
 
+fn write_remote_file_with_sha1(path: &std::path::Path, bytes: &[u8], sha1: &str) {
+    fs::write(path, bytes).unwrap();
+    fs::write(
+        path.with_extension(format!(
+            "{}.sha1",
+            path.extension().unwrap().to_string_lossy()
+        )),
+        sha1,
+    )
+    .unwrap();
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -493,4 +505,434 @@ fn resolve_uses_project_repositories() {
     let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
     assert!(lockfile.contains(r#"source = "local""#));
     assert!(lockfile.contains("demo-1.0.0.jar"));
+}
+
+#[test]
+fn resolve_locks_requested_version_for_remote_range() {
+    let project = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    let metadata_dir = remote.path().join("com/example/lib");
+    fs::create_dir_all(&metadata_dir).unwrap();
+    write_remote_file(
+        &metadata_dir.join("maven-metadata.xml"),
+        br#"
+        <metadata>
+          <versioning>
+            <versions>
+              <version>1.0.0</version>
+              <version>1.5.0</version>
+              <version>2.0.0</version>
+            </versions>
+          </versioning>
+        </metadata>
+        "#,
+    );
+    write_remote_artifact(remote.path(), "com.example", "lib", "1.5.0", "<project/>");
+    let repository_url = serve_directory(remote.path().to_path_buf());
+
+    fs::write(
+        project.path().join("angra.toml"),
+        format!(
+            r#"
+            [repositories]
+            local = "{repository_url}"
+
+            [dependencies]
+            lib = "com.example:lib:[1.0,2.0)"
+            "#
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let output = Command::new(binary)
+        .args(["resolve", "--project-dir", project.path().to_str().unwrap()])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    assert!(lockfile.contains(r#"version = "1.5.0""#));
+    assert!(lockfile.contains(r#"requested_version = "[1.0,2.0)""#));
+}
+
+#[test]
+fn resolve_locks_requested_version_for_timestamped_snapshot() {
+    let project = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    let snapshot_dir = remote.path().join("com/example/lib/1.0-SNAPSHOT");
+    fs::create_dir_all(&snapshot_dir).unwrap();
+    write_remote_file(
+        &snapshot_dir.join("maven-metadata.xml"),
+        br#"
+        <metadata>
+          <versioning>
+            <snapshotVersions>
+              <snapshotVersion>
+                <extension>jar</extension>
+                <value>1.0-20240501.120000-3</value>
+                <updated>20240501120000</updated>
+              </snapshotVersion>
+              <snapshotVersion>
+                <extension>pom</extension>
+                <value>1.0-20240501.120000-3</value>
+                <updated>20240501120000</updated>
+              </snapshotVersion>
+            </snapshotVersions>
+          </versioning>
+        </metadata>
+        "#,
+    );
+    write_remote_file(
+        &snapshot_dir.join("lib-1.0-20240501.120000-3.pom"),
+        b"<project/>",
+    );
+    write_remote_file(
+        &snapshot_dir.join("lib-1.0-20240501.120000-3.jar"),
+        b"jar for timestamped snapshot",
+    );
+    let repository_url = serve_directory(remote.path().to_path_buf());
+
+    fs::write(
+        project.path().join("angra.toml"),
+        format!(
+            r#"
+            [repositories]
+            snapshots = "{repository_url}"
+
+            [dependencies]
+            lib = "com.example:lib:1.0-SNAPSHOT"
+            "#
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let output = Command::new(binary)
+        .args(["resolve", "--project-dir", project.path().to_str().unwrap()])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    assert!(lockfile.contains(r#"version = "1.0-20240501.120000-3""#));
+    assert!(lockfile.contains(r#"requested_version = "1.0-SNAPSHOT""#));
+}
+
+#[test]
+fn resolve_warns_but_succeeds_for_checksum_warn_policy() {
+    let project = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    let repository_url = serve_directory(remote.path().to_path_buf());
+
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(
+        &local_repo,
+        "com.example",
+        "root",
+        "1.0.0",
+        &format!(
+            r#"
+            <project>
+              <repositories>
+                <repository>
+                  <id>warn-repo</id>
+                  <url>{repository_url}</url>
+                  <releases>
+                    <checksumPolicy>warn</checksumPolicy>
+                  </releases>
+                </repository>
+              </repositories>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>child</artifactId>
+                  <version>1.0.0</version>
+                </dependency>
+              </dependencies>
+            </project>
+            "#
+        ),
+    );
+
+    let child_dir = remote.path().join("com/example/child/1.0.0");
+    fs::create_dir_all(&child_dir).unwrap();
+    write_remote_file(&child_dir.join("child-1.0.0.pom"), b"<project/>");
+    write_remote_file_with_sha1(
+        &child_dir.join("child-1.0.0.jar"),
+        b"jar with bad checksum",
+        "0000000000000000000000000000000000000000",
+    );
+
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        root = "com.example:root:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let output = Command::new(binary)
+        .args(["resolve", "--project-dir", project.path().to_str().unwrap()])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning:"));
+    assert!(stderr.contains("checksum mismatch"));
+}
+
+#[test]
+fn resolve_activates_profile_by_file_exists() {
+    let project = TempDir::new().unwrap();
+    let local_repo = project.path().join(".m2").join("repository");
+    let marker = project.path().join("marker.txt");
+    fs::write(&marker, "marker").unwrap();
+
+    write_artifact(
+        &local_repo,
+        "com.example",
+        "root",
+        "1.0.0",
+        r#"
+        <project>
+          <profiles>
+            <profile>
+              <id>file-profile</id>
+              <activation>
+                <file><exists>marker.txt</exists></file>
+              </activation>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>child</artifactId>
+                  <version>1.0.0</version>
+                </dependency>
+              </dependencies>
+            </profile>
+          </profiles>
+        </project>
+        "#,
+    );
+    write_artifact(&local_repo, "com.example", "child", "1.0.0", "<project/>");
+
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        root = "com.example:root:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let output = Command::new(binary)
+        .args([
+            "resolve",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    assert!(lockfile.contains("child-1.0.0.jar"));
+}
+
+#[test]
+fn resolve_mirror_preserves_checksum_warn_policy() {
+    let project = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    let repository_url = serve_directory(remote.path().to_path_buf());
+
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(
+        &local_repo,
+        "com.example",
+        "root",
+        "1.0.0",
+        r#"
+            <project>
+              <repositories>
+                <repository>
+                  <id>warn-repo</id>
+                  <url>http://invalid.example.com</url>
+                  <releases>
+                    <checksumPolicy>warn</checksumPolicy>
+                  </releases>
+                </repository>
+              </repositories>
+              <dependencies>
+                <dependency>
+                  <groupId>com.example</groupId>
+                  <artifactId>child</artifactId>
+                  <version>1.0.0</version>
+                </dependency>
+              </dependencies>
+            </project>
+            "#,
+    );
+
+    let child_dir = remote.path().join("com/example/child/1.0.0");
+    fs::create_dir_all(&child_dir).unwrap();
+    write_remote_file(&child_dir.join("child-1.0.0.pom"), b"<project/>");
+    write_remote_file_with_sha1(
+        &child_dir.join("child-1.0.0.jar"),
+        b"jar with bad checksum",
+        "0000000000000000000000000000000000000000",
+    );
+
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        root = "com.example:root:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let settings_dir = project.path().join(".m2");
+    fs::create_dir_all(&settings_dir).unwrap();
+    fs::write(
+        settings_dir.join("settings.xml"),
+        format!(
+            r#"<settings>
+              <mirrors>
+                <mirror>
+                  <id>my-mirror</id>
+                  <mirrorOf>*</mirrorOf>
+                  <url>{repository_url}</url>
+                </mirror>
+              </mirrors>
+            </settings>"#
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let output = Command::new(binary)
+        .args(["resolve", "--project-dir", project.path().to_str().unwrap()])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning:"));
+    assert!(stderr.contains("checksum mismatch"));
+}
+
+#[test]
+fn resolve_bom_dependency_management_in_profile() {
+    let project = TempDir::new().unwrap();
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(
+        &local_repo,
+        "com.example",
+        "bom",
+        "1.0.0",
+        r#"
+        <project>
+          <profiles>
+            <profile>
+              <id>default-profile</id>
+              <activation><activeByDefault>true</activeByDefault></activation>
+              <dependencyManagement>
+                <dependencies>
+                  <dependency>
+                    <groupId>com.example</groupId>
+                    <artifactId>child</artifactId>
+                    <version>2.0.0</version>
+                  </dependency>
+                </dependencies>
+              </dependencyManagement>
+            </profile>
+          </profiles>
+        </project>
+        "#,
+    );
+    write_artifact(
+        &local_repo,
+        "com.example",
+        "root",
+        "1.0.0",
+        r#"
+        <project>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>bom</artifactId>
+                <version>1.0.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+          <dependencies>
+            <dependency>
+              <groupId>com.example</groupId>
+              <artifactId>child</artifactId>
+            </dependency>
+          </dependencies>
+        </project>
+        "#,
+    );
+    write_artifact(&local_repo, "com.example", "child", "2.0.0", "<project/>");
+
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        root = "com.example:root:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let output = Command::new(binary)
+        .args([
+            "resolve",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    assert!(lockfile.contains("child-2.0.0.jar"));
 }

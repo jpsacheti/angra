@@ -6,12 +6,12 @@ use std::{
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::maven::Repository;
+use crate::{manifest::RepositorySpec, maven::Repository};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default)]
-    pub repositories: IndexMap<String, String>,
+    pub repositories: IndexMap<String, RepositorySpec>,
 }
 
 impl GlobalConfig {
@@ -35,7 +35,7 @@ impl GlobalConfig {
     pub fn repositories(&self) -> Vec<Repository> {
         self.repositories
             .iter()
-            .map(|(name, url)| Repository::new(name, url))
+            .map(|(name, spec)| spec.to_repository(name))
             .collect()
     }
 }
@@ -81,7 +81,7 @@ mod tests {
             r#"
             [repositories]
             central = "https://repo1.maven.org/maven2/"
-            corporate = "https://nexus.example.com/maven/"
+            corporate = { url = "https://nexus.example.com/maven/", snapshots = false, checksum-policy = "warn" }
             "#,
         )
         .unwrap();
@@ -92,6 +92,11 @@ mod tests {
         assert_eq!(repos[0].url, MAVEN_CENTRAL_URL);
         assert_eq!(repos[1].name, "corporate");
         assert_eq!(repos[1].url, "https://nexus.example.com/maven");
+        assert!(!repos[1].snapshots.enabled);
+        assert_eq!(
+            repos[1].releases.checksum_policy,
+            crate::maven::ChecksumPolicy::Warn
+        );
     }
 
     #[test]

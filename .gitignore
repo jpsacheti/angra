@@ -8,6 +8,7 @@ angra.lock
 # Benchmark output
 /benches/canary/
 /benches/results/
+/benches/spring-fixture/*
 **/.gradle/
 
 # Local environment
