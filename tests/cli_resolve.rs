@@ -774,8 +774,7 @@ fn resolve_mirror_preserves_checksum_warn_policy() {
         "com.example",
         "root",
         "1.0.0",
-        &format!(
-            r#"
+        r#"
             <project>
               <repositories>
                 <repository>
@@ -794,8 +793,7 @@ fn resolve_mirror_preserves_checksum_warn_policy() {
                 </dependency>
               </dependencies>
             </project>
-            "#
-        ),
+            "#,
     );
 
     let child_dir = remote.path().join("com/example/child/1.0.0");

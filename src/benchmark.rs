@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -63,7 +64,12 @@ pub fn fixture_cases(root: &Path) -> Vec<BenchmarkCase> {
                 "-DincludeScope=runtime".to_string(),
                 "-DoutputFile=/private/tmp/angra-spring-benchmark-runtime-deps.txt".to_string(),
             ],
-            gradle_args: None,
+            gradle_args: Some(vec![
+                "--no-daemon".to_string(),
+                "dependencies".to_string(),
+                "--configuration".to_string(),
+                "runtimeClasspath".to_string(),
+            ]),
         });
     }
 
@@ -122,17 +128,58 @@ fn run_command(
     program: &Path,
     args: &[String],
 ) -> Result<BenchmarkResult, BenchmarkError> {
+    eprintln!(
+        "benchmark: starting {case}/{tool}: {} {}",
+        program.display(),
+        args.join(" ")
+    );
+
     let start = Instant::now();
-    let output = Command::new(program)
+    let mut child = Command::new(program)
         .args(args)
         .current_dir(directory)
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut next_progress_at = Duration::from_secs(5);
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= next_progress_at {
+            eprintln!(
+                "benchmark: still running {case}/{tool} after {:.1}s",
+                elapsed.as_secs_f64()
+            );
+            next_progress_at += Duration::from_secs(5);
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    let output = child.wait_with_output()?;
     let duration = start.elapsed();
+    let status = output.status.code().unwrap_or(-1);
+
+    if status == 0 {
+        eprintln!(
+            "benchmark: finished {case}/{tool} in {:.1}s",
+            duration.as_secs_f64()
+        );
+    } else {
+        eprintln!(
+            "benchmark: failed {case}/{tool} with status {status} after {:.1}s",
+            duration.as_secs_f64()
+        );
+    }
 
     Ok(BenchmarkResult {
         tool,
         case: case.to_string(),
-        status: output.status.code().unwrap_or(-1),
+        status,
         duration_ms: duration.as_millis(),
         duration,
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -144,6 +191,17 @@ fn run_command(
 pub enum BenchmarkError {
     #[error("failed to run benchmark command: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl std::fmt::Display for BenchmarkTool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Angra => "angra",
+            Self::Maven => "maven",
+            Self::Gradle => "gradle",
+        };
+        formatter.write_str(name)
+    }
 }
 
 #[cfg(test)]
@@ -158,5 +216,12 @@ mod tests {
             args,
             vec!["x", "maven@latest", "--", "mvn", "dependency:go-offline"]
         );
+    }
+
+    #[test]
+    fn formats_benchmark_tool_names() {
+        assert_eq!(BenchmarkTool::Angra.to_string(), "angra");
+        assert_eq!(BenchmarkTool::Maven.to_string(), "maven");
+        assert_eq!(BenchmarkTool::Gradle.to_string(), "gradle");
     }
 }

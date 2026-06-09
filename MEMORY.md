@@ -14,10 +14,10 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 ## Roadmap Shape
 
 - Keep `ROADMAP.md` as the checked-in roadmap and keep it in sync when milestone scope changes.
-- The 0.1 to 1.0 path ends at build and run:
+- Current milestone state:
   - 0.1 resolver MVP: shipped.
-  - 0.2 resolver realism: in progress.
-  - 0.3 manifest lifecycle: planned.
+  - 0.2 resolver realism: shipped.
+  - 0.3 manifest lifecycle: planned, ready to begin after the user provides the pending caveat.
   - 0.4 compile and test: planned.
   - 0.5 package and run: planned.
   - 1.0 hardening: planned.
@@ -35,7 +35,7 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Do not shell out to Maven for Angra resolution. That weakens the product premise and hides performance characteristics.
 - Starting with full `pom.xml` ingestion was intentionally rejected. The first compatibility target is Maven artifact/POM resolution behavior; source project POM import can come later.
 - Benchmarks compare Angra with Maven and Gradle using `mise` with dynamic latest Maven/Gradle versions. Do not pin those tool versions in repo config unless the benchmark design changes.
-- Benchmark output should be human-readable first, followed by raw JSON details.
+- Benchmark output should be human-readable first, followed by raw JSON details. The benchmark harness should print progress while external commands run so slow Maven/Gradle/mise work is distinguishable from a hung harness.
 
 ## Maven Model Decisions
 
@@ -75,7 +75,7 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Do not silently append Maven Central after configured repositories. Configured repositories are explicit.
 - Do not sort repositories by name; order is semantically meaningful fallback behavior.
 - A separate `--config` flag is premature.
-- Additional remote repositories declared in POMs are isolated using Lexically Scoped Repositories (Approach A). Each dependency in the resolution queue carries its own list of permitted active repositories. Discovered repositories are merged down to children and descendants, preventing "repository leakage/pollution" across unrelated packages. This was chosen over global dynamic appending for safety and predictability, matching modern tools like Cargo and uv.
+- Additional remote repositories declared in POMs are isolated using Lexically Scoped Repositories (Approach A). Each dependency in the resolution queue carries its own list of permitted active repositories. Discovered repositories are merged down to children and descendants, preventing repository leakage across unrelated packages.
 - Settings mirrors are applied dynamically to POM-discovered repositories before they are used to fetch artifacts.
 
 ## Maven Settings Decisions
@@ -92,7 +92,7 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - `<servers>`, `<proxies>`, and auth are deferred.
 - Maven `external:*` mirror semantics and broader glob/regex `mirrorOf` patterns are deferred; current repositories are HTTP(S)-oriented.
 
-## Download Integrity
+## Download Integrity And Policies
 
 - Remote Maven downloads are verified against sibling `.sha1` files before writing artifacts or POMs into the local repository.
 - Verified `.sha1` files are stored next to local files using Maven's `file.ext.sha1` layout.
@@ -102,26 +102,18 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Do not fall back to MD5.
 - Do not reverify already-cached local files on every resolve; warm-cache speed matters. This can be revisited when Maven checksum policies are modeled.
 - Full Maven checksum policy behavior is deferred until settings policy support exists.
-
-## Repository Policy Decisions
-
 - Repositories carry release and snapshot policies modeled as `RepositoryPolicy { enabled: bool }`.
 - Maven Central defaults to releases=true, snapshots=false, matching real Maven Central behavior.
 - All other repositories (angra.toml, global config, settings, POM-declared) default to both enabled unless explicitly overridden.
-- SNAPSHOT detection uses the `-SNAPSHOT` suffix convention (case-sensitive). Timestamp/build-number resolution is supported through Maven metadata, including `snapshotVersions` and legacy `<snapshot>` timestamp/build number fields.
+- SNAPSHOT detection uses the `-SNAPSHOT` suffix convention, case-sensitive. Timestamp/build-number resolution is supported through Maven metadata, including `snapshotVersions` and legacy `<snapshot>` timestamp/build number fields.
 - Repository policies are parsed from POM `<releases><enabled>` and `<snapshots><enabled>` elements, and from settings.xml profile repository policy elements.
 - The resolver skips repositories whose policy does not match the artifact version type before attempting any download.
 - `checksumPolicy` is modeled. `updatePolicy` and other policy sub-elements remain deferred.
 
-## Auth Diagnostics
+## Diagnostics And Performance
 
-- HTTP 401 (Unauthorized) and 403 (Forbidden) responses are intercepted and produce a dedicated `AuthenticationRequired` error.
-- The error message explicitly states that Angra does not yet support authenticated repositories and suggests configuring a mirror or using a public repository.
-- Auth errors immediately fail resolution rather than falling through to the next repository, since a 401/403 from a repo that should have the artifact is a real signal.
-- Actual authentication (`<servers>`, credentials, tokens) remains deferred.
-
-## Resolver Diagnostics And Performance
-
+- HTTP 401 and 403 responses produce a dedicated `AuthenticationRequired` error. Auth errors immediately fail resolution rather than falling through to the next repository.
+- Actual authentication (`<servers>`, credentials, tokens) and proxies remain deferred.
 - Track dependency provenance in the resolver queue as a vector of `ArtifactCoordinate` values.
 - Wrap artifact fetch, effective-POM, and dependency parse failures with the active dependency path.
 - CLI resolver failures render a compact, colorized `root -> child -> failing-artifact` path.
@@ -130,6 +122,7 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Same-depth batching gives network parallelism without changing nearest-wins conflict semantics.
 - Do not rewrite the resolver around async `reqwest` unless blocking plus bounded parallelism stops being enough.
 - Do not parallelize effective-POM parent/BOM expansion until races around shared descriptor paths are explicitly designed.
+- A future `tokio` adoption is under consideration for more complex async networking or filesystem I/O, but this does not override the lightweight/JVM-free resolver constraint.
 
 ## Benchmarks And Canaries
 
@@ -138,9 +131,10 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Apache Commons Compress is the current real-world resolver canary because it stresses parent POMs, inherited properties, managed dependencies, optional dependencies, and a moderate runtime graph.
 - Commons Compress canary manifests, isolated Maven repos, and timing output should live under `/private/tmp`.
 - Benchmark warm-cache/offline resolver behavior against Maven's runtime dependency tree when comparing overhead.
-- The local Spring Boot fixture under `benches/spring-fixture` is a resolver canary for Angra-native BOM management and Maven runtime-set parity. It is included by the bench harness when present and is Angra-vs-Maven only unless a Gradle build is added.
+- The local Spring Boot fixture under `benches/spring-fixture` is a resolver canary for Angra-native BOM management and Maven runtime-set parity. It is included by the bench harness when present and now has Gradle runtimeClasspath support.
 - Do not treat temporary Angra TOML canaries as proof of source `pom.xml` ingestion.
 - Do not benchmark cold network resolution as a primary signal; network variability hides resolver overhead.
+- Last known sandbox benchmark caveat: Angra completed successfully, but Maven/Gradle failed because `mise` could not fetch/write tool metadata cleanly under sandboxed network/cache constraints.
 
 ## Dependency Upgrade Notes
 
@@ -149,6 +143,7 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Cargo ignores semver build metadata in version requirements; write `toml = "1.1.2"` rather than `1.1.2+spec-1.1.0`.
 - `quick-xml` 0.40 text handling should decode text and then unescape XML entities explicitly.
 - `sha1` and `sha2` 0.11 finalized digest outputs no longer implement `LowerHex` directly. Hex-encode finalized bytes locally unless a broader formatting need justifies a dependency.
+- `faster-hex` was adopted for checksum hex serialization to prioritize runtime performance and code safety over compile-time savings.
 
 ## Current Open Boundaries
 
@@ -161,105 +156,42 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 
 ## Next Priorities
 
-- Continue 0.2 resolver realism with the remaining Maven compatibility gaps: snapshots, version ranges, and profile activation.
-- Re-run the Commons Compress canary after settings/mirror-related resolver changes.
-- Keep tests, clippy, and benchmark coverage aligned with any resolver behavior change.
+- Capture the user's pending caveat before starting 0.3.
+- Begin 0.3 manifest lifecycle from a clean 0.2 base.
+- Implement manifest-editing commands conservatively: `init`, `add`, `remove`, `lock`, `tree`, `why`, `import-pom`, and read-only workspace primitives.
+- Keep tests, clippy, formatting, and benchmark coverage aligned with any CLI or manifest behavior change.
 
-## Decision Entry - 2026-05-26
+## Shipped Milestone Notes
 
-- **What was decided:** 0.2 remaining resolver work moved to a full compatibility push: timestamped SNAPSHOT resolution, Maven version ranges, resolver-relevant profile activation/injection, local parent `<relativePath>`, and checksum `fail`/`warn`/`ignore`.
-- **Why:** These gaps were blocking realistic Maven graph compatibility and had enough bounded resolver surface to implement without introducing Maven plugin execution or JVM startup.
-- **Rejected and why:** Deferring ranges/profiles/snapshots was rejected because it would keep 0.2 unable to explain or resolve common Maven metadata-driven graphs. Maven-like `-P`/`-D` flags were rejected for this slice in favor of manifest-based profile controls that fit Angra's TOML-first UX. Lock-stable range reuse was rejected for now; ranges resolve fresh and lock the concrete result.
-- **Validation target:** Keep `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, and resolver canaries green after this slice.
-
-## Decision Entry - 2026-05-26
-
-- **What was decided:** Support Angra-native dependency management in `angra.toml` through `[dependency-management]`, including BOM imports with `type = "pom", scope = "import"`, and apply root dependency management across the resolved graph.
-- **Why:** The Spring Boot fixture needs the same managed-version behavior Maven gets from its parent/BOM, and Angra should stand on its own TOML manifest rather than requiring a source `pom.xml` import for this resolver slice.
-- **Rejected and why:** Treating the Spring fixture as explicit direct dependencies only was rejected because it matched artifact count but drifted managed transitive versions. Ingesting the fixture's source `pom.xml` as the project manifest was rejected as a separate feature boundary.
-
-## Decision Entry - 2026-05-26
-
-- **What was decided:** Implemented single-pass linear XML properties parsing in `pom.rs`, Mutex-wrapped `BTreeMap` caching for `EffectivePom` inside `Resolver`, and continuous work-queue channel-based parallel downloading in `Resolver::ensure_artifacts_parallel`.
-- **Why:** POM files, especially massive BOMs like `spring-boot-dependencies`, were scanned quadratically $O(N)$ times for properties (where $N$ is the number of profiles). Lack of caching caused recursive re-parsing of identical parent POMs and BOMs for every reference. Additionally, the barrier chunking downloader left network threads idle. Caching and properties optimization improved warm-cache resolution on the Spring fixture to **287ms** (yielding a **5.7x** speedup over Maven).
-- **Rejected and why:** Relying on heavy external async runtimes or thread-pooling crates (like `tokio` or `rayon`) was rejected to keep Angra JVM-free and extremely lightweight, instead utilizing standard library `thread::scope` and `mpsc::channel` for safe, lock-free work dispatching.
+- **0.1 Resolver MVP:** `angra resolve`, Maven Central/local repository layout, runtime graph traversal, deterministic lockfile, and benchmark harness shipped.
+- **0.2 Resolver realism:** Maven version ranges, timestamped SNAPSHOTs, recursive effective POMs, local parent `<relativePath>`, dependency management, BOM imports, profile activation/injection, repository/settings/mirror/policy support, artifact identity (`jar`, `pom`, `war`, classifier), SHA-1 verification, resolver diagnostics, and parallel fetch behavior shipped.
+- **0.2 performance work:** Single-pass XML property parsing, effective-POM caching, local relative-parent POM caching, and continuous worker-queue artifact downloading replaced slower repeated parsing and barrier-style downloads.
+- **0.2 validation:** Latest green housekeeping run had `cargo fmt --check`, `cargo test` (90 unit tests, 13 integration tests), and `cargo clippy --all-targets -- -D warnings` passing. Release benchmark ran; Angra succeeded while Maven/Gradle failed due to sandboxed `mise` constraints.
 
 ## Rejected Paths To Preserve
 
-- No durable memory was rejected; future sessions need decision continuity.
 - Treating TOML ergonomics as separate from Maven compatibility was rejected.
 - Full uv-equivalent scope before 1.0 was rejected as too broad.
 - Built-in JDK management was rejected for the current roadmap.
 - A flat backlog-only roadmap was rejected because it loses the narrative of what 1.0 means.
 - A separate architecture RFC was rejected in favor of folding strategic architecture decisions into the roadmap.
 - A full dependency graph abstraction was rejected for current failure attribution; queue path tracking is enough.
-- A manual bit-flipping hex-encoding function was initially implemented but subsequently rejected in favor of the highly optimized, SIMD-accelerated 'faster-hex' library to prioritize maximum runtime speed and code safety over compile-time savings.
+- Full source `pom.xml` ingestion as the first compatibility target was rejected; artifact/POM resolution compatibility came first.
+- Maven-like `-P`/`-D` flags were rejected for the resolver slice in favor of manifest-based profile controls.
+- Lock-stable range reuse was rejected for now; ranges resolve fresh and lock the concrete result.
+- Treating the Spring fixture as explicit direct dependencies only was rejected because it matched artifact count but drifted managed transitive versions.
+- Relying on heavy external async runtimes or thread-pooling crates for 0.2 was rejected; standard `thread::scope` and `mpsc` were enough.
 - Parsing auth or mirrors in the original settings repository slice was rejected to keep review boundaries small; mirrors have since landed, auth remains deferred.
+- Setting up local git pre-commit hooks was rejected for now; validation remains explicit until a CI pipeline exists.
 
-## Session Summary - 2026-05-24
+## Decision Entry - 2026-06-02 (Memory Compaction)
 
-- **Worked on:** Repository policy basics (releases/snapshots checking in resolver and POM/settings parsing), dynamic settings-based mirrors matching and application, deferred authentication diagnostic handling, and hex-encoding optimization.
-- **Completed:**
-  - `RepositoryPolicy` support with case-sensitive snapshot detection.
-  - Dynamic settings mirrors matching (`*`, negation, comma-separated), deduplication, and repository rewrite.
-  - `AuthenticationRequired` custom error diagnostic providing actionable steps on 401/403 intercept.
-  - Integrated `faster-hex` library for SIMD-accelerated checksum hex serialization.
-  - Created the `feature/repo-policies-and-mirror` branch and committed all work with 77 unit tests, 7 integration tests, formatting, and clippy passing cleanly.
-- **In progress:** None.
-- **Decisions made:**
-  - Adopted `faster-hex` dependency to prioritize runtime performance over compile time.
-  - Selected lexically scoped repositories (Approach A) to prevent repository leakage across dependencies.
-  - Rejected setting up local git pre-commit hooks for now, leaving validation checks for a future comprehensive CI pipeline.
-- **Next session priorities:**
-  - Implement full SNAPSHOT timestamp/build-number resolution.
-  - Add version ranges support.
-  - Implement full Maven profile activation logic (property, OS, JDK, and file-based activations).
-  - Re-run the Commons Compress canary to verify resolution performance with settings and mirrors applied.
+- **What was decided:** Conservatively compacted `MEMORY.md` by preserving durable decisions, current state, open boundaries, validation status, and next priorities while collapsing repetitive 0.2 session detail.
+- **Why:** Future 0.3 sessions need continuity without rereading the full resolver implementation diary.
+- **Rejected and why:** Aggressive compaction was rejected because it might hide useful resolver constraints. Keeping session-by-session history was rejected because git history and `ROADMAP.md` already carry implementation detail.
 
-## Session Summary - 2026-05-26
+## Decision Entry - 2026-06-03 (Tokio Reopened, Deferred)
 
-- **Worked on:** Resolution performance optimization under hot and cold caches, specifically profiling and improving XML properties parsing, resolving parent/BOM graph evaluation redundancy, and network thread saturation.
-- **Completed:**
-  - Designed and implemented single-pass linear XML properties parsing (`read_all_properties`) in `src/pom.rs` to replace quadratic profile-scanning properties lookup.
-  - Implemented `Mutex<BTreeMap<String, EffectivePom>>` caching inside `Resolver` to cache resolved coordinate models, and `path_pom_cache` to cache local relative parent POMs.
-  - Replaced barrier chunk parallel downloads with a continuous queue parallel worker downloader in `Resolver::ensure_artifacts_parallel` using standard library `thread::scope` and `std::sync::mpsc`.
-  - Verified all 86 unit tests and 10 integration tests pass green.
-  - Ran release-mode benchmark suite to confirm the optimized warm-cache `spring-fixture` resolution speedup to **287ms** (a **5.7x** speed improvement over Maven).
-- **In progress:** None.
-- **Decisions made:**
-  - Implemented custom single-pass XML properties parsing to keep quick-xml deserialization lightweight and linear.
-  - Mutex-cached effective POM coordinates to drop duplicate parent/BOM resolution to zero.
-  - Rejected external async runtimes (like `tokio`) or thread-pooling libraries (like `rayon`) for parallel downloading to keep Angra compile-time light and dependency-light, instead utilizing standard `thread::scope` and `mpsc::channel`.
-- **Next session priorities:**
-  - Implement full SNAPSHOT timestamp/build-number resolution.
-  - Add version ranges support.
-  - Implement full Maven profile activation logic (property, OS, JDK, and file-based activations).
-  - Re-run the Commons Compress canary to verify resolution performance with settings and mirrors applied.
-
-## Session Summary - 2026-05-26 (Resolver Full Compat)
-
-- **Worked on:** 0.2 remaining resolver work including timestamped SNAPSHOT resolution, Maven version ranges, resolver-relevant profile activation/injection, local parent `<relativePath>`, and checksum policies.
-- **Completed:**
-  - Implemented Maven version ranges and metadata-driven selection.
-  - Implemented timestamped SNAPSHOT resolution.
-  - Implemented full Maven profile activation (activeByDefault, property, OS, JDK, file).
-  - Implemented local parent `<relativePath>` lookup.
-  - Implemented repository `checksumPolicy` (fail, warn, ignore).
-  - Code was reviewed by Claude.
-- **In progress:** 
-  - Applying the 6 minor cleanups identified in Claude's review.
-  - Splitting the staged changes into logical commits.
-  - Adding 3 missing test cases mentioned in the review.
-- **Decisions made:**
-  - JDK activation reads `[resolver.maven].java-version` or `$JAVA_HOME/release` without spawning a `java` process.
-- **Next session priorities:**
-  - Address the 6 minor cleanups from Claude's review.
-  - Split the staged changes into logical commits.
-  - Add the three missing test cases (profile activation by file, mirror+checksum warn interaction, BOM with management in profile).
-  - Perform final verification using the full test suite and confirm benchmark consistency.
-
-## Decision Entry - 2026-05-26 (Tokio Consideration)
-
-- **What was decided:** The project is considering the adoption of `tokio`.
-- **Why:** To potentially handle more complex asynchronous networking or filesystem I/O in the future.
-- **Rejected and why:** Previously rejected external async runtimes to keep the tool JVM-free and lightweight. This is now being reconsidered.
+- **What was decided:** Reopened the Tokio question and deferred the call until angra accumulates a real async workload (e.g. concurrent background indexer, watch-mode resolver, or live registry streaming). Re-evaluation trigger: a concrete async-shaped feature lands in the roadmap.
+- **Why:** Current `thread::scope` + `mpsc` work-queue in `Resolver::ensure_artifacts_parallel` already hits the 5.7x-over-Maven target, and the blocking `reqwest` path has no measured cold-network pain. Adopting Tokio now would add compile-time and dependency weight without a clear bottleneck to solve.
+- **Rejected and why:** Adopting Tokio speculatively (ahead of an async feature) was rejected because it would couple the project to a runtime before a real driver exists, mirroring the 0.2 rejection at MEMORY.md:185. Switching only the parallel-fetch loop to async was rejected for now because it would split the codebase into two concurrency styles with no measured benefit.

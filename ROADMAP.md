@@ -4,8 +4,8 @@ Angra aims to be a fast, Maven-compatible Java project tool — `uv` ergonomics 
 
 This roadmap covers milestones **0.1 through 1.0**, ending at a usable replacement for everyday Maven workflows (resolve, add deps, build, test, run, package). The core architecture is a Rust driver that keeps normal CLI operations JVM-free, spawning Java only when compilation, tests, runtime execution, or future plugin compatibility require it. Publishing, built-in JDK management, IDE plugins, Maven plugin execution, and the long tail of Maven feature parity are deferred — see the [Deferred](#deferred) section. The decision log lives in [MEMORY.md](MEMORY.md).
 
-- **Last updated:** 2026-05-26 (resolver full compatibility push)
-- **Current milestone:** 0.2 (in progress — effective POM support started)
+- **Last updated:** 2026-06-02 (0.2 closure)
+- **Current milestone:** 0.3 (planned — ready to begin)
 
 ## Status legend
 
@@ -32,7 +32,7 @@ In `master` today:
 
 ---
 
-## 0.2 — Resolver realism **[in progress]**
+## 0.2 — Resolver realism **[shipped]**
 
 **Goal:** Resolve any real-world Java project (Spring Boot starters, Jackson, Guava, Netty) without surprises, while keeping resolution much faster than Maven/Gradle. This is where Angra proves the Rust-driver advantage: no JVM startup for dependency checks, parallel network work, and clear failure attribution.
 
@@ -55,7 +55,7 @@ In `master` today:
 
 **Critical files:** `src/resolver.rs` (most of the change), `src/maven.rs` (`.sha1` URLs, classifiers), `src/pom.rs` for effective-model behavior, and a possible cache/index module after profiling.
 
-**Exit criteria:** A Spring Boot fixture resolves cleanly and matches Maven's runtime resolution set. Bench harness gains a Spring fixture case.
+**Exit criteria:** met. The Spring Boot fixture resolves cleanly, matches Maven's runtime resolution set, and is included by the benchmark harness when present.
 
 ---
 

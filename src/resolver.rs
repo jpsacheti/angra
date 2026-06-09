@@ -519,7 +519,8 @@ impl Resolver {
         };
 
         let active_raw = raw.active_model(&self.profile_activation);
-        let mut effective = active_raw.merge_with_parent_with_context(parent, &self.profile_activation);
+        let mut effective =
+            active_raw.merge_with_parent_with_context(parent, &self.profile_activation);
         let properties = effective.property_context();
         for dependency in active_raw.dependency_management_entries() {
             if dependency.is_bom_import() {
