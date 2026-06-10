@@ -1554,3 +1554,167 @@ fn resolve_frozen_downloads_missing_artifact_and_verifies_checksum() {
             .exists()
     );
 }
+
+fn write_remote_metadata(repo: &std::path::Path, group: &str, artifact: &str, xml: &str) {
+    let dir = repo.join(group.replace('.', "/")).join(artifact);
+    fs::create_dir_all(&dir).unwrap();
+    write_remote_file(&dir.join("maven-metadata.xml"), xml.as_bytes());
+}
+
+#[test]
+fn outdated_reports_newer_versions_from_remote_metadata() {
+    let project = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    write_remote_metadata(
+        remote.path(),
+        "com.example",
+        "demo",
+        r#"<metadata>
+            <groupId>com.example</groupId>
+            <artifactId>demo</artifactId>
+            <versioning>
+                <latest>1.2.0</latest>
+                <release>1.2.0</release>
+                <versions>
+                    <version>1.0.0</version>
+                    <version>1.2.0</version>
+                    <version>2.0.0-SNAPSHOT</version>
+                </versions>
+            </versioning>
+        </metadata>"#,
+    );
+    let repository_url = serve_directory(remote.path().to_path_buf());
+
+    fs::write(
+        project.path().join("angra.toml"),
+        format!(
+            r#"
+            [repositories]
+            remote = "{repository_url}"
+
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            "#
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let outdated = Command::new(binary)
+        .args([
+            "outdated",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        outdated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&outdated.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&outdated.stdout);
+    assert!(
+        stdout.contains("demo (com.example:demo) 1.0.0 -> 1.2.0"),
+        "{stdout}"
+    );
+    // Read-only: no lockfile is created.
+    assert!(!project.path().join("angra.lock").exists());
+}
+
+#[test]
+fn outdated_reports_up_to_date_and_skips_ranges_and_snapshots() {
+    let project = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    write_remote_metadata(
+        remote.path(),
+        "com.example",
+        "demo",
+        r#"<metadata>
+            <versioning>
+                <release>1.0.0</release>
+                <versions><version>1.0.0</version></versions>
+            </versioning>
+        </metadata>"#,
+    );
+    let repository_url = serve_directory(remote.path().to_path_buf());
+
+    fs::write(
+        project.path().join("angra.toml"),
+        format!(
+            r#"
+            [repositories]
+            remote = "{repository_url}"
+
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            ranged = "com.example:ranged:[1.0,2.0)"
+            snap = "com.example:snap:3.0.0-SNAPSHOT"
+            "#
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let outdated = Command::new(binary)
+        .args([
+            "outdated",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        outdated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&outdated.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&outdated.stdout);
+    assert!(
+        stdout.contains("all dependencies are up to date"),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&outdated.stderr);
+    assert!(stderr.contains("skipped `ranged`"), "{stderr}");
+    assert!(stderr.contains("skipped `snap`"), "{stderr}");
+}
+
+#[test]
+fn outdated_offline_warns_when_no_metadata_is_cached() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        demo = "com.example:demo:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let outdated = Command::new(binary)
+        .args([
+            "outdated",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        outdated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&outdated.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&outdated.stderr);
+    assert!(
+        stderr.contains("no version metadata found for `demo`"),
+        "{stderr}"
+    );
+}

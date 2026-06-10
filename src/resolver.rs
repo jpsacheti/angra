@@ -19,8 +19,8 @@ use crate::{
         ManifestError, Project, WritableManifest, unique_alias,
     },
     maven::{
-        ArtifactCoordinate, ArtifactIdentity, ArtifactType, ChecksumPolicy, Coordinate, Repository,
-        RepositoryPolicy, Scope, VersionRange,
+        ArtifactCoordinate, ArtifactIdentity, ArtifactType, ChecksumPolicy, Coordinate,
+        MavenVersion, Repository, RepositoryPolicy, Scope, VersionRange,
     },
     metadata::MavenMetadata,
     pom::{EffectivePom, ManagedDependency, Pom, PomError, ProfileActivationContext},
@@ -206,6 +206,91 @@ pub fn resolve_frozen_project(
         return Err(ResolveError::FrozenManifestDrift);
     }
 
+    let resolver = project_resolver(&manifest, &options)?;
+
+    for locked in &lockfile.artifacts {
+        resolver.ensure_frozen_artifact(locked)?;
+    }
+
+    let warnings = resolver.into_warnings();
+    Ok(FrozenResolveOutput { lockfile, warnings })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutdatedStatus {
+    UpToDate,
+    Outdated { latest: String },
+    Skipped { reason: String },
+    NoMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutdatedReport {
+    pub alias: String,
+    pub artifact: ArtifactCoordinate,
+    pub status: OutdatedStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutdatedOutput {
+    pub reports: Vec<OutdatedReport>,
+    pub warnings: Vec<String>,
+}
+
+/// Report direct dependencies with newer versions available from configured
+/// repositories. Read-only: neither the manifest nor the lockfile is touched.
+pub fn outdated_project(options: ResolveOptions) -> Result<OutdatedOutput, ResolveError> {
+    let manifest_path = options.project_dir.join("angra.toml");
+    let manifest = Manifest::read(&manifest_path)?;
+    let dependencies = manifest.declared_dependencies()?;
+    let resolver = project_resolver(&manifest, &options)?;
+
+    let mut reports = Vec::new();
+    for dependency in dependencies {
+        let current = &dependency.artifact.coordinate.version;
+        let status = if VersionRange::is_range_spec(current) {
+            OutdatedStatus::Skipped {
+                reason: "version ranges resolve to the newest matching version on each lock"
+                    .to_string(),
+            }
+        } else if dependency.artifact.coordinate.is_snapshot() {
+            OutdatedStatus::Skipped {
+                reason: "SNAPSHOT versions update in place".to_string(),
+            }
+        } else {
+            let versions = resolver
+                .metadata_versions(&dependency.artifact.coordinate, &resolver.repositories)?;
+            match newest_release_version(&versions) {
+                None => OutdatedStatus::NoMetadata,
+                Some(latest) if MavenVersion::new(&latest) > MavenVersion::new(current) => {
+                    OutdatedStatus::Outdated { latest }
+                }
+                Some(_) => OutdatedStatus::UpToDate,
+            }
+        };
+        reports.push(OutdatedReport {
+            alias: dependency.alias,
+            artifact: dependency.artifact,
+            status,
+        });
+    }
+
+    let warnings = resolver.into_warnings();
+    Ok(OutdatedOutput { reports, warnings })
+}
+
+fn newest_release_version(versions: &[String]) -> Option<String> {
+    versions
+        .iter()
+        .filter(|version| !version.ends_with("-SNAPSHOT"))
+        .max_by(|left, right| MavenVersion::new(left).cmp(&MavenVersion::new(right)))
+        .cloned()
+}
+
+fn project_resolver(
+    manifest: &Manifest,
+    options: &ResolveOptions,
+) -> Result<Resolver, ResolveError> {
     let global_config = GlobalConfig::load()?;
     let settings = MavenSettings::load()?;
     let mut activation_properties = settings.properties.clone();
@@ -222,24 +307,18 @@ pub fn resolve_frozen_project(
     settings.apply_mirrors(&mut repositories);
     let local_repo = options
         .local_repo
+        .clone()
         .or(settings.local_repository.clone())
         .map(Ok)
         .unwrap_or_else(default_local_repo)?;
-    let resolver = Resolver::new_with_activation(
+    Resolver::new_with_activation(
         local_repo,
         repositories,
         settings,
         profile_activation,
         options.offline,
-        false,
-    )?;
-
-    for locked in &lockfile.artifacts {
-        resolver.ensure_frozen_artifact(locked)?;
-    }
-
-    let warnings = resolver.into_warnings();
-    Ok(FrozenResolveOutput { lockfile, warnings })
+        options.refresh,
+    )
 }
 
 pub fn import_pom(options: PomImportOptions) -> Result<PomImportOutput, ResolveError> {
@@ -429,33 +508,7 @@ fn resolve_project_inner(
     let manifest_fingerprint = manifest.resolver_fingerprint()?;
     let dependencies = manifest.declared_dependencies()?;
     let dependency_management = manifest.declared_dependency_management()?;
-    let global_config = GlobalConfig::load()?;
-    let settings = MavenSettings::load()?;
-    let mut activation_properties = settings.properties.clone();
-    activation_properties.extend(manifest.resolver.maven.properties.clone());
-    let profile_activation = ProfileActivationContext::new(
-        manifest.resolver.maven.active_profiles.clone(),
-        manifest.resolver.maven.inactive_profiles.clone(),
-        activation_properties,
-        manifest.resolver.maven.java_version.clone(),
-        options.project_dir.clone(),
-    );
-    let mut repositories =
-        manifest.declared_repositories(&global_config.repositories(), &settings.repositories);
-    settings.apply_mirrors(&mut repositories);
-    let local_repo = options
-        .local_repo
-        .or(settings.local_repository.clone())
-        .map(Ok)
-        .unwrap_or_else(default_local_repo)?;
-    let resolver = Resolver::new_with_activation(
-        local_repo,
-        repositories,
-        settings.clone(),
-        profile_activation,
-        options.offline,
-        options.refresh,
-    )?;
+    let resolver = project_resolver(&manifest, &options)?;
     let artifacts =
         resolver.resolve_with_dependency_management(dependencies, dependency_management)?;
     let warnings = resolver.into_warnings();
@@ -1822,6 +1875,19 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn newest_release_version_orders_maven_style_and_skips_snapshots() {
+        let versions =
+            ["1.0.0", "1.10.0", "1.9.0", "2.0.0-SNAPSHOT", "1.10.0-rc1"].map(String::from);
+
+        assert_eq!(
+            newest_release_version(&versions),
+            Some("1.10.0".to_string())
+        );
+        assert_eq!(newest_release_version(&[]), None);
+        assert_eq!(newest_release_version(&["1.0-SNAPSHOT".to_string()]), None);
+    }
     use crate::manifest::DeclaredDependency;
 
     fn write_artifact(repo: &Path, coordinate: &Coordinate, pom_body: &str) {

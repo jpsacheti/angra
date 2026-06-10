@@ -140,6 +140,21 @@ enum Command {
         project_dir: PathBuf,
     },
 
+    /// Report direct dependencies with newer versions available.
+    Outdated {
+        /// Check using only locally cached version metadata.
+        #[arg(long)]
+        offline: bool,
+
+        /// Re-fetch version metadata even when a cached copy exists.
+        #[arg(long)]
+        refresh: bool,
+
+        /// Project directory containing angra.toml.
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+
     /// Print why an artifact is present in the resolved graph.
     Why {
         /// Maven coordinate in group:artifact or group:artifact:version form.
@@ -317,6 +332,19 @@ fn run() -> Result<(), CommandError> {
             project_dir,
         } => {
             let output = commands::tree(LockOptions {
+                project_dir,
+                offline,
+                refresh,
+            })?;
+            print_warnings(&output.warnings);
+            println!("{}", output.text);
+        }
+        Command::Outdated {
+            offline,
+            refresh,
+            project_dir,
+        } => {
+            let output = commands::outdated(LockOptions {
                 project_dir,
                 offline,
                 refresh,

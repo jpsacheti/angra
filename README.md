@@ -17,6 +17,7 @@ manifest lifecycle commands.
 - `angra lock` / `angra resolve`
 - `angra resolve --frozen` — lockfile-authoritative installs with manifest drift detection and SHA-256 verification
 - `angra tree` / `angra why`
+- `angra outdated` — report direct dependencies with newer versions available
 - `angra.toml` as the project manifest
 - Compact Maven coordinates:
 
@@ -142,6 +143,13 @@ angra add com.google.guava:guava:33.0.0-jre
 angra add junit:junit:4.13.2 --scope test
 angra tree
 angra why com.google.guava:guava
+```
+
+Check for newer versions of direct dependencies (read-only; version ranges
+and SNAPSHOTs are skipped with a warning since they update through `angra lock`):
+
+```sh
+angra outdated
 ```
 
 ## Benchmarks

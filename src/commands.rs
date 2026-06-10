@@ -11,8 +11,8 @@ use crate::{
     },
     maven::{ArtifactCoordinate, ArtifactType, Coordinate, CoordinateError, Scope},
     resolver::{
-        FrozenResolveOutput, PomImportOptions, ResolveOutput, import_pom, inspect_project,
-        resolve_frozen_project, resolve_project,
+        FrozenResolveOutput, OutdatedStatus, PomImportOptions, ResolveOutput, import_pom,
+        inspect_project, outdated_project, resolve_frozen_project, resolve_project,
     },
 };
 
@@ -218,6 +218,52 @@ pub fn why(query: &str, options: LockOptions) -> Result<TextOutput, CommandError
             .join(" -> "),
         warnings: output.warnings,
     })
+}
+
+pub fn outdated(options: LockOptions) -> Result<TextOutput, CommandError> {
+    let output = outdated_project(resolve_options(
+        options.project_dir,
+        options.offline,
+        options.refresh,
+    ))?;
+
+    let mut warnings = output.warnings;
+    let mut lines = Vec::new();
+    for report in &output.reports {
+        let coordinate = format!(
+            "{}:{}",
+            report.artifact.coordinate.group, report.artifact.coordinate.artifact
+        );
+        match &report.status {
+            OutdatedStatus::Outdated { latest } => lines.push(format!(
+                "{} ({coordinate}) {} -> {latest}",
+                report.alias, report.artifact.coordinate.version
+            )),
+            OutdatedStatus::UpToDate => {}
+            OutdatedStatus::Skipped { reason } => {
+                warnings.push(format!(
+                    "skipped `{}` ({coordinate}): {reason}",
+                    report.alias
+                ));
+            }
+            OutdatedStatus::NoMetadata => {
+                warnings.push(format!(
+                    "no version metadata found for `{}` ({coordinate})",
+                    report.alias
+                ));
+            }
+        }
+    }
+
+    let text = if output.reports.is_empty() {
+        "(no dependencies declared)".to_string()
+    } else if lines.is_empty() {
+        "all dependencies are up to date".to_string()
+    } else {
+        lines.join("\n")
+    };
+
+    Ok(TextOutput { text, warnings })
 }
 
 fn resolve_options(project_dir: PathBuf, offline: bool, refresh: bool) -> ResolveOptions {
