@@ -120,7 +120,10 @@ pub(crate) struct Pom {
     group_id: Option<String>,
     artifact_id: Option<String>,
     version: Option<String>,
+    packaging: Option<String>,
     parent: Option<PomParent>,
+    #[serde(default)]
+    modules: PomModules,
     #[serde(skip)]
     properties: BTreeMap<String, String>,
     #[serde(default)]
@@ -131,6 +134,12 @@ pub(crate) struct Pom {
     repositories: PomRepositories,
     #[serde(default)]
     profiles: PomProfiles,
+    #[serde(default)]
+    build: Option<PomSectionPresence>,
+    #[serde(default)]
+    reporting: Option<PomSectionPresence>,
+    #[serde(default)]
+    distribution_management: Option<PomSectionPresence>,
 }
 
 impl Pom {
@@ -152,6 +161,26 @@ impl Pom {
             self.artifact_id.clone(),
             self.version.clone(),
         )
+    }
+
+    pub(crate) fn packaging(&self) -> Option<&str> {
+        self.packaging.as_deref()
+    }
+
+    pub(crate) fn modules(&self) -> &[String] {
+        &self.modules.modules
+    }
+
+    pub(crate) fn has_build_section(&self) -> bool {
+        self.build.is_some()
+    }
+
+    pub(crate) fn has_reporting_section(&self) -> bool {
+        self.reporting.is_some()
+    }
+
+    pub(crate) fn has_distribution_management_section(&self) -> bool {
+        self.distribution_management.is_some()
     }
 
     pub(crate) fn parent_coordinate(&self, source: &str) -> Result<Option<Coordinate>, PomError> {
@@ -322,6 +351,15 @@ impl Pom {
         active
     }
 }
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct PomModules {
+    #[serde(rename = "module", default)]
+    modules: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct PomSectionPresence {}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -861,6 +899,14 @@ impl PomDependency {
         self.scope.is_import() && self.dependency_type.as_deref().unwrap_or("jar") == "pom"
     }
 
+    pub(crate) fn unsupported_scope(&self) -> Option<&str> {
+        self.scope.unsupported_scope()
+    }
+
+    pub(crate) fn is_optional(&self) -> bool {
+        self.optional
+    }
+
     pub(crate) fn graph_scope(&self) -> Option<Scope> {
         self.scope.graph_scope()
     }
@@ -1056,24 +1102,29 @@ struct PomExclusion {
     artifact_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PomScope {
     scope: Scope,
     explicit: bool,
     import: bool,
+    unsupported: Option<String>,
 }
 
 impl PomScope {
-    fn graph_scope(self) -> Option<Scope> {
+    fn graph_scope(&self) -> Option<Scope> {
         if self.import { None } else { Some(self.scope) }
     }
 
-    fn is_explicit_graph_scope(self) -> bool {
+    fn is_explicit_graph_scope(&self) -> bool {
         self.explicit && !self.import
     }
 
-    fn is_import(self) -> bool {
+    fn is_import(&self) -> bool {
         self.import
+    }
+
+    fn unsupported_scope(&self) -> Option<&str> {
+        self.unsupported.as_deref()
     }
 }
 
@@ -1083,6 +1134,7 @@ impl Default for PomScope {
             scope: Scope::Compile,
             explicit: false,
             import: false,
+            unsupported: None,
         }
     }
 }
@@ -1099,31 +1151,37 @@ impl<'de> serde::Deserialize<'de> for PomScope {
                 scope: Scope::Compile,
                 explicit: true,
                 import: false,
+                unsupported: None,
             },
             Some("runtime") => Self {
                 scope: Scope::Runtime,
                 explicit: true,
                 import: false,
+                unsupported: None,
             },
             Some("test") => Self {
                 scope: Scope::Test,
                 explicit: true,
                 import: false,
+                unsupported: None,
             },
             Some("provided") => Self {
                 scope: Scope::Provided,
                 explicit: true,
                 import: false,
+                unsupported: None,
             },
             Some("import") => Self {
                 scope: Scope::Compile,
                 explicit: true,
                 import: true,
+                unsupported: None,
             },
-            Some(_) => Self {
+            Some(scope) => Self {
                 scope: Scope::Compile,
                 explicit: true,
                 import: false,
+                unsupported: Some(scope.to_string()),
             },
         })
     }

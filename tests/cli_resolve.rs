@@ -936,3 +936,300 @@ fn resolve_bom_dependency_management_in_profile() {
     let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
     assert!(lockfile.contains("child-2.0.0.jar"));
 }
+
+#[test]
+fn import_pom_writes_effective_manifest_and_resolves_offline() {
+    let project = TempDir::new().unwrap();
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(
+        &local_repo,
+        "com.example",
+        "bom",
+        "1.0.0",
+        r#"
+        <project>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>managed</artifactId>
+                <version>2.0.0</version>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+        </project>
+        "#,
+    );
+    write_artifact(&local_repo, "com.example", "managed", "2.0.0", "<project/>");
+    fs::write(
+        project.path().join("parent.xml"),
+        r#"
+        <project>
+          <groupId>com.example</groupId>
+          <artifactId>parent</artifactId>
+          <version>1.0.0</version>
+        </project>
+        "#,
+    )
+    .unwrap();
+    let pom = project.path().join("pom.xml");
+    fs::write(
+        &pom,
+        r#"
+        <project>
+          <parent>
+            <groupId>com.example</groupId>
+            <artifactId>parent</artifactId>
+            <version>1.0.0</version>
+            <relativePath>parent.xml</relativePath>
+          </parent>
+          <artifactId>app</artifactId>
+          <modules>
+            <module>lib</module>
+          </modules>
+          <build>
+            <plugins>
+              <plugin><artifactId>maven-compiler-plugin</artifactId></plugin>
+            </plugins>
+          </build>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>bom</artifactId>
+                <version>1.0.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+          <dependencies>
+            <dependency>
+              <groupId>com.example</groupId>
+              <artifactId>managed</artifactId>
+            </dependency>
+          </dependencies>
+        </project>
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let import = Command::new(binary)
+        .args(["import-pom", pom.to_str().unwrap(), "--offline"])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&import.stderr);
+    assert!(stderr.contains("workspace"));
+    assert!(stderr.contains("<build>"));
+
+    let manifest = fs::read_to_string(project.path().join("angra.toml")).unwrap();
+    assert!(manifest.contains("artifact = \"app\""));
+    assert!(manifest.contains("members = [\"lib\"]"));
+    assert!(manifest.contains("managed = \"com.example:managed:2.0.0\""));
+    assert!(manifest.contains("scope = \"import\""));
+
+    let resolve = Command::new(binary)
+        .args([
+            "resolve",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        resolve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolve.stderr)
+    );
+    let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    assert!(lockfile.contains("managed-2.0.0.jar"));
+}
+
+#[test]
+fn import_pom_refuses_existing_manifest_without_force() {
+    let project = TempDir::new().unwrap();
+    let pom = project.path().join("pom.xml");
+    fs::write(
+        &pom,
+        r#"
+        <project>
+          <groupId>com.example</groupId>
+          <artifactId>app</artifactId>
+          <version>0.1.0</version>
+        </project>
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("angra.toml"),
+        "[project]\nartifact = \"app\"\n",
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let output = Command::new(binary)
+        .args(["import-pom", pom.to_str().unwrap(), "--offline"])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("manifest already exists"));
+}
+
+#[test]
+fn tree_and_why_print_resolved_paths_without_writing_lockfile() {
+    let project = TempDir::new().unwrap();
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(
+        &local_repo,
+        "com.example",
+        "root",
+        "1.0.0",
+        r#"
+        <project>
+          <dependencies>
+            <dependency>
+              <groupId>com.example</groupId>
+              <artifactId>child</artifactId>
+              <version>1.0.0</version>
+            </dependency>
+          </dependencies>
+        </project>
+        "#,
+    );
+    write_artifact(&local_repo, "com.example", "child", "1.0.0", "<project/>");
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        root = "com.example:root:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let tree = Command::new(binary)
+        .args([
+            "tree",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        tree.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tree.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&tree.stdout);
+    assert!(stdout.contains("com.example:root:1.0.0 [compile]"));
+    assert!(stdout.contains("  com.example:child:1.0.0 [compile]"));
+    assert!(!project.path().join("angra.lock").exists());
+
+    let why = Command::new(binary)
+        .args([
+            "why",
+            "com.example:child",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        why.status.success(),
+        "{}",
+        String::from_utf8_lossy(&why.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&why.stdout);
+    assert!(stdout.contains("com.example:root:1.0.0 -> com.example:child:1.0.0"));
+    assert!(!project.path().join("angra.lock").exists());
+}
+
+#[test]
+fn init_add_and_remove_manage_manifest_and_lockfile() {
+    let project = TempDir::new().unwrap();
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(&local_repo, "com.example", "demo", "1.0.0", "<project/>");
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let init = Command::new(binary)
+        .args([
+            "init",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+            "--group",
+            "com.example",
+            "--artifact",
+            "app",
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let add = Command::new(binary)
+        .args([
+            "add",
+            "com.example:demo:1.0.0",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let manifest = fs::read_to_string(project.path().join("angra.toml")).unwrap();
+    assert!(manifest.contains("demo = \"com.example:demo:1.0.0\""));
+    let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    assert!(lockfile.contains("demo-1.0.0.jar"));
+
+    let remove = Command::new(binary)
+        .args([
+            "remove",
+            "demo",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let manifest = fs::read_to_string(project.path().join("angra.toml")).unwrap();
+    assert!(!manifest.contains("com.example:demo:1.0.0"));
+    let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    assert!(lockfile.contains("artifacts = []"));
+}

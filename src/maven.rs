@@ -185,6 +185,19 @@ impl ArtifactType {
     }
 }
 
+impl FromStr for ArtifactType {
+    type Err = CoordinateError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "" | "jar" => Ok(Self::Jar),
+            "pom" => Ok(Self::Pom),
+            "war" => Ok(Self::War),
+            value => Err(CoordinateError::InvalidArtifactType(value.to_string())),
+        }
+    }
+}
+
 impl Display for ArtifactType {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.extension())
@@ -767,6 +780,31 @@ impl Scope {
     }
 }
 
+impl FromStr for Scope {
+    type Err = CoordinateError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "" | "compile" => Ok(Self::Compile),
+            "runtime" => Ok(Self::Runtime),
+            "test" => Ok(Self::Test),
+            "provided" => Ok(Self::Provided),
+            value => Err(CoordinateError::InvalidScope(value.to_string())),
+        }
+    }
+}
+
+impl Display for Scope {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Compile => "compile",
+            Self::Runtime => "runtime",
+            Self::Test => "test",
+            Self::Provided => "provided",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinateError {
     #[error("invalid Maven coordinate `{0}`, expected group:artifact:version")]
@@ -775,6 +813,10 @@ pub enum CoordinateError {
     InvalidExclusion(String),
     #[error("invalid Maven version range `{0}`")]
     InvalidVersionRange(String),
+    #[error("unsupported Maven artifact type `{0}`, expected jar, pom, or war")]
+    InvalidArtifactType(String),
+    #[error("unsupported Maven scope `{0}`, expected compile, runtime, test, or provided")]
+    InvalidScope(String),
 }
 
 #[cfg(test)]

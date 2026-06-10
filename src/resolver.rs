@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ use crate::{
     lockfile::{LockedArtifact, Lockfile, LockfileError},
     manifest::{
         DeclaredDependency, DeclaredManagedDependency, ManagedDependencyScope, Manifest,
-        ManifestError,
+        ManifestError, Project, WritableManifest, unique_alias,
     },
     maven::{
         ArtifactCoordinate, ArtifactIdentity, ArtifactType, ChecksumPolicy, Coordinate, Repository,
@@ -36,9 +36,82 @@ pub struct ResolveOptions {
 }
 
 #[derive(Debug, Clone)]
+pub struct PomImportOptions {
+    pub pom_path: PathBuf,
+    pub offline: bool,
+    pub refresh: bool,
+    pub local_repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PomImportOutput {
+    pub manifest: WritableManifest,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResolveOutput {
     pub lockfile: Lockfile,
+    pub graph: ResolutionGraph,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolutionGraph {
+    pub artifacts: Vec<ResolvedGraphArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGraphArtifact {
+    pub artifact: ArtifactCoordinate,
+    pub scope: Scope,
+    pub depth: usize,
+    pub path: Vec<ArtifactCoordinate>,
+}
+
+impl ResolutionGraph {
+    fn from_artifacts(artifacts: &[ResolvedArtifact]) -> Self {
+        let mut artifacts = artifacts
+            .iter()
+            .map(|artifact| ResolvedGraphArtifact {
+                artifact: artifact.artifact.clone(),
+                scope: artifact.scope,
+                depth: artifact.depth,
+                path: artifact.path.clone(),
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| {
+            left.path
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .cmp(
+                    &right
+                        .path
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                )
+                .then_with(|| left.artifact.cmp(&right.artifact))
+        });
+        Self { artifacts }
+    }
+
+    pub fn path_to(
+        &self,
+        group: &str,
+        artifact: &str,
+        version: Option<&str>,
+    ) -> Option<&[ArtifactCoordinate]> {
+        self.artifacts
+            .iter()
+            .find(|entry| {
+                entry.artifact.coordinate.group == group
+                    && entry.artifact.coordinate.artifact == artifact
+                    && version.is_none_or(|version| entry.artifact.coordinate.version == version)
+            })
+            .map(|entry| entry.path.as_slice())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +130,7 @@ struct ResolvedArtifact {
     requested_version: Option<String>,
     scope: Scope,
     depth: usize,
+    path: Vec<ArtifactCoordinate>,
     pom_path: PathBuf,
     artifact_path: PathBuf,
     source: String,
@@ -95,6 +169,195 @@ struct ResolvedArtifactVersion {
 }
 
 pub fn resolve_project(options: ResolveOptions) -> Result<ResolveOutput, ResolveError> {
+    resolve_project_inner(options, true)
+}
+
+pub fn inspect_project(options: ResolveOptions) -> Result<ResolveOutput, ResolveError> {
+    resolve_project_inner(options, false)
+}
+
+pub fn import_pom(options: PomImportOptions) -> Result<PomImportOutput, ResolveError> {
+    let pom_path = options.pom_path;
+    let project_dir = pom_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let global_config = GlobalConfig::load()?;
+    let settings = MavenSettings::load()?;
+    let mut repositories =
+        baseline_repositories(&global_config.repositories(), &settings.repositories);
+    settings.apply_mirrors(&mut repositories);
+    let local_repo = options
+        .local_repo
+        .or(settings.local_repository.clone())
+        .map(Ok)
+        .unwrap_or_else(default_local_repo)?;
+    let profile_activation = ProfileActivationContext::new(
+        Vec::<String>::new(),
+        Vec::<String>::new(),
+        settings.properties.clone(),
+        None,
+        project_dir,
+    );
+    let resolver = Resolver::new_with_activation(
+        local_repo,
+        repositories.clone(),
+        settings,
+        profile_activation,
+        options.offline,
+        options.refresh,
+    )?;
+
+    let raw = Pom::read(&pom_path)?;
+    let active_raw = raw.active_model(&resolver.profile_activation);
+    let source = pom_path.display().to_string();
+    let effective = resolver.effective_pom_from_path(&pom_path, &repositories, &mut Vec::new())?;
+    let properties = effective.property_context();
+    let mut warnings = import_warnings(&raw, &source);
+
+    let mut dependency_management = Vec::new();
+    let mut used_management_aliases = BTreeSet::new();
+    if let Some(parent) = raw.parent_coordinate(&source)? {
+        let parent_artifact = ArtifactCoordinate::pom(parent);
+        if parent_artifact.pom_path(&resolver.local_repo).exists() {
+            let alias = unique_alias(
+                &mut used_management_aliases,
+                &parent_artifact.coordinate.group,
+                &parent_artifact.coordinate.artifact,
+            );
+            dependency_management.push(DeclaredManagedDependency {
+                alias,
+                artifact: parent_artifact,
+                scope: ManagedDependencyScope::Import,
+                exclusions: Vec::new(),
+            });
+        } else {
+            warnings.push(format!(
+                "did not import parent POM `{}` because it was only available through Maven relativePath",
+                parent_artifact.coordinate
+            ));
+        }
+    }
+
+    for dependency in active_raw.dependency_management_entries() {
+        if let Some(scope) = dependency.unsupported_scope() {
+            warnings.push(format!(
+                "skipped dependency-management entry with unsupported Maven scope `{scope}`"
+            ));
+            continue;
+        }
+
+        if dependency.is_bom_import() {
+            let Some(coordinate) = dependency.coordinate(&properties, &source)? else {
+                warnings.push(
+                    "skipped dependency-management BOM import without a complete coordinate"
+                        .to_string(),
+                );
+                continue;
+            };
+            let alias = unique_alias(
+                &mut used_management_aliases,
+                &coordinate.group,
+                &coordinate.artifact,
+            );
+            dependency_management.push(DeclaredManagedDependency {
+                alias,
+                artifact: ArtifactCoordinate::pom(coordinate),
+                scope: ManagedDependencyScope::Import,
+                exclusions: Vec::new(),
+            });
+            continue;
+        }
+
+        let Some((identity, managed)) = dependency.managed_dependency(&properties, &source)? else {
+            warnings.push(
+                "skipped dependency-management entry without a complete coordinate".to_string(),
+            );
+            continue;
+        };
+        let Some(version) = managed.version else {
+            warnings.push(format!(
+                "skipped dependency-management entry `{}:{}` without a concrete version",
+                identity.group, identity.artifact
+            ));
+            continue;
+        };
+        let alias = unique_alias(
+            &mut used_management_aliases,
+            &identity.group,
+            &identity.artifact,
+        );
+        dependency_management.push(DeclaredManagedDependency {
+            alias,
+            artifact: ArtifactCoordinate::new(
+                Coordinate::new(&identity.group, &identity.artifact, &version),
+                identity.artifact_type,
+                identity.classifier,
+            ),
+            scope: managed
+                .scope
+                .map(ManagedDependencyScope::Graph)
+                .unwrap_or_default(),
+            exclusions: managed.exclusions,
+        });
+    }
+
+    let mut dependencies = Vec::new();
+    let mut used_dependency_aliases = BTreeSet::new();
+    for dependency in &effective.dependencies {
+        if let Some(scope) = dependency.unsupported_scope() {
+            warnings.push(format!(
+                "skipped dependency with unsupported Maven scope `{scope}`"
+            ));
+            continue;
+        }
+        if dependency.is_optional() {
+            warnings.push(
+                "imported optional Maven dependency as a normal Angra dependency".to_string(),
+            );
+        }
+
+        let Some(resolved) =
+            dependency.resolve(&properties, &source, &effective.dependency_management)?
+        else {
+            warnings.push("skipped dependency without a complete concrete coordinate".to_string());
+            continue;
+        };
+        let alias = unique_alias(
+            &mut used_dependency_aliases,
+            &resolved.artifact.coordinate.group,
+            &resolved.artifact.coordinate.artifact,
+        );
+        dependencies.push(DeclaredDependency {
+            alias,
+            artifact: resolved.artifact,
+            scope: resolved.scope,
+            exclusions: resolved.exclusions,
+        });
+    }
+
+    warnings.extend(resolver.into_warnings());
+
+    Ok(PomImportOutput {
+        manifest: WritableManifest {
+            project: Some(Project {
+                group: effective.group_id,
+                artifact: effective.artifact_id,
+                version: effective.version,
+            }),
+            workspace_members: raw.modules().to_vec(),
+            repositories: effective.repositories,
+            dependency_management,
+            dependencies,
+        },
+        warnings,
+    })
+}
+
+fn resolve_project_inner(
+    options: ResolveOptions,
+    write_lockfile: bool,
+) -> Result<ResolveOutput, ResolveError> {
     let manifest_path = options.project_dir.join("angra.toml");
     let manifest = Manifest::read(&manifest_path)?;
     let dependencies = manifest.declared_dependencies()?;
@@ -129,6 +392,7 @@ pub fn resolve_project(options: ResolveOptions) -> Result<ResolveOutput, Resolve
     let artifacts =
         resolver.resolve_with_dependency_management(dependencies, dependency_management)?;
     let warnings = resolver.into_warnings();
+    let graph = ResolutionGraph::from_artifacts(&artifacts);
 
     let lockfile = Lockfile::new(
         artifacts
@@ -148,8 +412,14 @@ pub fn resolve_project(options: ResolveOptions) -> Result<ResolveOutput, Resolve
             .collect::<Result<Vec<_>, ResolveError>>()?,
     );
 
-    lockfile.write_if_changed(&options.project_dir.join("angra.lock"))?;
-    Ok(ResolveOutput { lockfile, warnings })
+    if write_lockfile {
+        lockfile.write_if_changed(&options.project_dir.join("angra.lock"))?;
+    }
+    Ok(ResolveOutput {
+        lockfile,
+        graph,
+        warnings,
+    })
 }
 
 struct Resolver {
@@ -297,6 +567,7 @@ impl Resolver {
                         requested_version: fetched.requested_version.clone(),
                         scope: item.scope,
                         depth: item.depth,
+                        path: item.path.clone(),
                         pom_path: fetched.artifact.pom_path(&self.local_repo),
                         artifact_path: fetched.artifact.artifact_path(&self.local_repo),
                         source: fetched.source,
@@ -1083,6 +1354,54 @@ fn drain_depth_batch(
     }
 
     batch
+}
+
+fn baseline_repositories(global: &[Repository], settings: &[Repository]) -> Vec<Repository> {
+    if global.is_empty() && settings.is_empty() {
+        return vec![Repository::maven_central()];
+    }
+
+    let mut repositories = global.to_vec();
+    for repository in settings {
+        if !repositories
+            .iter()
+            .any(|existing| existing.name == repository.name)
+        {
+            repositories.push(repository.clone());
+        }
+    }
+    repositories
+}
+
+fn import_warnings(raw: &Pom, source: &str) -> Vec<String> {
+    let mut warnings = vec![format!(
+        "import-pom is a one-way migration from `{source}`; Maven build/plugin behavior is not imported"
+    )];
+
+    if let Some(packaging) = raw.packaging()
+        && packaging != "jar"
+    {
+        warnings.push(format!(
+            "Maven packaging `{packaging}` is not modeled by 0.3 manifest import"
+        ));
+    }
+    if raw.has_build_section() {
+        warnings.push("ignored Maven <build> configuration and plugins".to_string());
+    }
+    if raw.has_reporting_section() {
+        warnings.push("ignored Maven <reporting> configuration".to_string());
+    }
+    if raw.has_distribution_management_section() {
+        warnings.push("ignored Maven <distributionManagement> publishing metadata".to_string());
+    }
+    if !raw.modules().is_empty() {
+        warnings.push(
+            "wrote Maven <modules> as read-only [workspace] members; orchestration arrives later"
+                .to_string(),
+        );
+    }
+
+    warnings
 }
 
 fn default_local_repo() -> Result<PathBuf, ResolveError> {

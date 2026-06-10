@@ -6,11 +6,16 @@ The goal is to bring `uv`-style ergonomics to Java: a small TOML manifest,
 minimal ceremony, fast dependency resolution, and compatibility with the Maven
 artifact ecosystem.
 
-Angra is very early. The current MVP focuses on dependency resolution.
+Angra is very early. The current MVP focuses on dependency resolution and
+manifest lifecycle commands.
 
 ## What Works Today
 
-- `angra resolve`
+- `angra init`
+- `angra import-pom`
+- `angra add` / `angra remove`
+- `angra lock` / `angra resolve`
+- `angra tree` / `angra why`
 - `angra.toml` as the project manifest
 - Compact Maven coordinates:
 
@@ -100,7 +105,7 @@ environment = "test"
 Resolve dependencies:
 
 ```sh
-angra resolve
+angra lock
 ```
 
 Resolve from local cache only:
@@ -113,6 +118,21 @@ Force a remote re-check:
 
 ```sh
 angra resolve --refresh
+```
+
+Start from an existing Maven project:
+
+```sh
+angra import-pom pom.xml
+```
+
+Add and inspect dependencies without hand-editing TOML:
+
+```sh
+angra add com.google.guava:guava:33.0.0-jre
+angra add junit:junit:4.13.2 --scope test
+angra tree
+angra why com.google.guava:guava
 ```
 
 ## Benchmarks
@@ -141,7 +161,7 @@ Raw JSON results are printed after the summary.
 
 The MVP intentionally does not support every Maven feature yet. In particular:
 
-- `pom.xml` ingestion as a project manifest
+- Live `pom.xml` execution as a project manifest. `angra import-pom` is a one-way, lossy migration command.
 - Private repositories
 - Authentication
 - Unknown Maven artifact types beyond `jar`, `pom`, and `war`
