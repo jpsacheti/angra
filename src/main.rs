@@ -1,7 +1,14 @@
 use std::path::PathBuf;
 
-use angra::{ResolveError, ResolveOptions, maven::ArtifactCoordinate, resolve_project};
-use clap::{Parser, Subcommand};
+use angra::{
+    ResolveError,
+    commands::{
+        self, AddOptions, CommandError, FrozenOptions, ImportPomCommandOptions, InitOptions,
+        LockOptions, RemoveOptions,
+    },
+    maven::{ArtifactCoordinate, ArtifactType, Scope},
+};
+use clap::{Parser, Subcommand, ValueEnum};
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -20,8 +27,71 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Resolve dependencies from angra.toml and write angra.lock.
-    Resolve {
+    /// Scaffold an angra.toml manifest.
+    Init {
+        /// Project directory where angra.toml should be written.
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+
+        /// Project group ID.
+        #[arg(long)]
+        group: Option<String>,
+
+        /// Project artifact ID.
+        #[arg(long)]
+        artifact: Option<String>,
+
+        /// Project version.
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Replace an existing angra.toml.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Add a dependency to angra.toml and update angra.lock.
+    Add {
+        /// Maven coordinate in group:artifact:version form.
+        coordinate: String,
+
+        /// Manifest alias to use under [dependencies].
+        #[arg(long)]
+        alias: Option<String>,
+
+        /// Dependency scope.
+        #[arg(long, value_enum, default_value_t = CliScope::Compile)]
+        scope: CliScope,
+
+        /// Maven artifact type.
+        #[arg(long = "type", value_enum, default_value_t = CliArtifactType::Jar)]
+        artifact_type: CliArtifactType,
+
+        /// Optional Maven classifier.
+        #[arg(long)]
+        classifier: Option<String>,
+
+        /// Exclusion in group:artifact form. May be repeated.
+        #[arg(long = "exclude")]
+        exclusions: Vec<String>,
+
+        /// Project directory containing angra.toml.
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+
+    /// Remove a dependency from angra.toml and update angra.lock.
+    Remove {
+        /// Manifest alias to remove from [dependencies].
+        alias: String,
+
+        /// Project directory containing angra.toml.
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+
+    /// Resolve dependencies and update angra.lock.
+    Lock {
         /// Resolve without fetching missing artifacts.
         #[arg(long)]
         offline: bool,
@@ -34,6 +104,128 @@ enum Command {
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
     },
+
+    /// Resolve dependencies from angra.toml and write angra.lock.
+    Resolve {
+        /// Resolve without fetching missing artifacts.
+        #[arg(long)]
+        offline: bool,
+
+        /// Re-check remote artifacts even when local files already exist.
+        #[arg(long)]
+        refresh: bool,
+
+        /// Install exactly what angra.lock records and fail on manifest drift,
+        /// instead of re-resolving.
+        #[arg(long, conflicts_with = "refresh")]
+        frozen: bool,
+
+        /// Project directory containing angra.toml.
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+
+    /// Print the resolved dependency graph.
+    Tree {
+        /// Resolve without fetching missing artifacts.
+        #[arg(long)]
+        offline: bool,
+
+        /// Re-check remote artifacts even when local files already exist.
+        #[arg(long)]
+        refresh: bool,
+
+        /// Project directory containing angra.toml.
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+
+    /// Report direct dependencies with newer versions available.
+    Outdated {
+        /// Check using only locally cached version metadata.
+        #[arg(long)]
+        offline: bool,
+
+        /// Re-fetch version metadata even when a cached copy exists.
+        #[arg(long)]
+        refresh: bool,
+
+        /// Project directory containing angra.toml.
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+
+    /// Print why an artifact is present in the resolved graph.
+    Why {
+        /// Maven coordinate in group:artifact or group:artifact:version form.
+        coordinate: String,
+
+        /// Resolve without fetching missing artifacts.
+        #[arg(long)]
+        offline: bool,
+
+        /// Re-check remote artifacts even when local files already exist.
+        #[arg(long)]
+        refresh: bool,
+
+        /// Project directory containing angra.toml.
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+
+    /// Import a Maven pom.xml into an angra.toml manifest.
+    ImportPom {
+        /// Path to the Maven pom.xml to import.
+        path: PathBuf,
+
+        /// Resolve imported POM parents/BOMs without fetching missing artifacts.
+        #[arg(long)]
+        offline: bool,
+
+        /// Re-check remote POMs even when local files already exist.
+        #[arg(long)]
+        refresh: bool,
+
+        /// Replace an existing angra.toml beside the POM.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliScope {
+    Compile,
+    Runtime,
+    Test,
+    Provided,
+}
+
+impl From<CliScope> for Scope {
+    fn from(value: CliScope) -> Self {
+        match value {
+            CliScope::Compile => Self::Compile,
+            CliScope::Runtime => Self::Runtime,
+            CliScope::Test => Self::Test,
+            CliScope::Provided => Self::Provided,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliArtifactType {
+    Jar,
+    Pom,
+    War,
+}
+
+impl From<CliArtifactType> for ArtifactType {
+    fn from(value: CliArtifactType) -> Self {
+        match value {
+            CliArtifactType::Jar => Self::Jar,
+            CliArtifactType::Pom => Self::Pom,
+            CliArtifactType::War => Self::War,
+        }
+    }
 }
 
 fn main() {
@@ -43,34 +235,157 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), ResolveError> {
+fn run() -> Result<(), CommandError> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Resolve {
+        Command::Init {
+            project_dir,
+            group,
+            artifact,
+            version,
+            force,
+        } => {
+            let path = commands::init(InitOptions {
+                project_dir,
+                group,
+                artifact,
+                version,
+                force,
+            })?;
+            println!(
+                "{} wrote {}",
+                paint("success:", GREEN),
+                paint(&path.display().to_string(), CYAN)
+            );
+        }
+        Command::Add {
+            coordinate,
+            alias,
+            scope,
+            artifact_type,
+            classifier,
+            exclusions,
+            project_dir,
+        } => {
+            let output = commands::add(AddOptions {
+                project_dir,
+                coordinate,
+                alias,
+                scope: scope.into(),
+                artifact_type: artifact_type.into(),
+                classifier,
+                exclusions,
+            })?;
+            print_warnings(&output.warnings);
+            print_lock_success(output.lockfile.artifacts.len());
+        }
+        Command::Remove { alias, project_dir } => {
+            let output = commands::remove(RemoveOptions { project_dir, alias })?;
+            print_warnings(&output.warnings);
+            print_lock_success(output.lockfile.artifacts.len());
+        }
+        Command::Lock {
             offline,
             refresh,
             project_dir,
         } => {
-            let output = resolve_project(ResolveOptions {
+            let output = commands::lock(LockOptions {
                 project_dir,
                 offline,
                 refresh,
-                local_repo: None,
             })?;
-
-            for warning in &output.warnings {
-                eprintln!(
-                    "{} {warning}",
-                    paint("warning:", &format!("{BOLD}\x1b[33m"))
+            print_warnings(&output.warnings);
+            print_lock_success(output.lockfile.artifacts.len());
+        }
+        Command::Resolve {
+            offline,
+            refresh,
+            frozen,
+            project_dir,
+        } => {
+            if frozen {
+                let output = commands::resolve_frozen(FrozenOptions {
+                    project_dir,
+                    offline,
+                })?;
+                print_warnings(&output.warnings);
+                println!(
+                    "{} verified {} artifacts against {}",
+                    paint("success:", GREEN),
+                    paint(&output.lockfile.artifacts.len().to_string(), BOLD),
+                    paint("angra.lock", CYAN)
                 );
+            } else {
+                let output = commands::lock(LockOptions {
+                    project_dir,
+                    offline,
+                    refresh,
+                })?;
+                print_warnings(&output.warnings);
+                print_lock_success(output.lockfile.artifacts.len());
             }
-
+        }
+        Command::Tree {
+            offline,
+            refresh,
+            project_dir,
+        } => {
+            let output = commands::tree(LockOptions {
+                project_dir,
+                offline,
+                refresh,
+            })?;
+            print_warnings(&output.warnings);
+            println!("{}", output.text);
+        }
+        Command::Outdated {
+            offline,
+            refresh,
+            project_dir,
+        } => {
+            let output = commands::outdated(LockOptions {
+                project_dir,
+                offline,
+                refresh,
+            })?;
+            print_warnings(&output.warnings);
+            println!("{}", output.text);
+        }
+        Command::Why {
+            coordinate,
+            offline,
+            refresh,
+            project_dir,
+        } => {
+            let output = commands::why(
+                &coordinate,
+                LockOptions {
+                    project_dir,
+                    offline,
+                    refresh,
+                },
+            )?;
+            print_warnings(&output.warnings);
+            println!("{}", output.text);
+        }
+        Command::ImportPom {
+            path,
+            offline,
+            refresh,
+            force,
+        } => {
+            let output = commands::import_pom_manifest(ImportPomCommandOptions {
+                pom_path: path,
+                offline,
+                refresh,
+                force,
+            })?;
+            print_warnings(&output.warnings);
             println!(
-                "{} resolved {} artifacts into {}",
+                "{} wrote {}",
                 paint("success:", GREEN),
-                paint(&output.lockfile.artifacts.len().to_string(), BOLD),
-                paint("angra.lock", CYAN)
+                paint(&output.manifest_path.display().to_string(), CYAN)
             );
         }
     }
@@ -78,14 +393,34 @@ fn run() -> Result<(), ResolveError> {
     Ok(())
 }
 
-fn print_error(error: &ResolveError) {
-    eprintln!(
-        "{} {}",
-        paint("error:", &format!("{BOLD}{RED}")),
-        error.root_cause()
+fn print_lock_success(count: usize) {
+    println!(
+        "{} resolved {} artifacts into {}",
+        paint("success:", GREEN),
+        paint(&count.to_string(), BOLD),
+        paint("angra.lock", CYAN)
     );
+}
 
-    if let Some(path) = error.dependency_path()
+fn print_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!(
+            "{} {warning}",
+            paint("warning:", &format!("{BOLD}\x1b[33m"))
+        );
+    }
+}
+
+fn print_error(error: &CommandError) {
+    let message = error
+        .resolve_error()
+        .map(ResolveError::root_cause)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| error.to_string());
+    eprintln!("{} {}", paint("error:", &format!("{BOLD}{RED}")), message);
+
+    if let Some(resolve_error) = error.resolve_error()
+        && let Some(path) = resolve_error.dependency_path()
         && !path.is_empty()
     {
         eprintln!();

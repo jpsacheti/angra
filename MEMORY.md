@@ -17,10 +17,13 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Current milestone state:
   - 0.1 resolver MVP: shipped.
   - 0.2 resolver realism: shipped.
-  - 0.3 manifest lifecycle: planned, ready to begin after the user provides the pending caveat.
+  - 0.3 manifest lifecycle: in progress, migration-first with effective concrete `import-pom`.
   - 0.4 compile and test: planned.
   - 0.5 package and run: planned.
+  - 0.6 private repositories (basic auth): planned.
   - 1.0 hardening: planned.
+- Basic CI (fmt/test/clippy on every PR) was pulled forward from 1.0 into 0.3; bench-on-PR remains a 1.0 item.
+- Windows support is an explicit deferral past 1.0, recorded in `ROADMAP.md` Deferred.
 - Use versioned milestones with plain text status tags such as `[shipped]`, `[in progress]`, `[planned]`, and `[deferred]`.
 - Each milestone should exit with tests and clippy green, a fixture project working end to end, benchmark harness updates where relevant, and a memory entry for durable decisions.
 - Publishing, IDE plugins, built-in JDK management, and arbitrary Maven plugin execution are deferred beyond the 1.0 inner-loop target unless explicitly reprioritized.
@@ -62,6 +65,8 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Lockfile artifact fields are artifact-neutral: use `artifact_path`, `artifact_sha256`, `type`, and optional `classifier`. Avoid jar-specific naming.
 - Dependency paths are diagnostics only. Do not persist resolver provenance in `angra.lock`.
 - Lockfiles record concrete resolved versions for ranges and timestamped SNAPSHOTs. When the requested version differs, `requested_version` records the original range or `-SNAPSHOT` request.
+- `angra.lock` carries an optional `manifest_fingerprint`: SHA-256 over canonical resolver-relevant manifest intent (dependencies, dependency management, project repositories, `[resolver.maven]`). It is an input digest for `--frozen` drift detection, not resolver provenance; machine-global config and Maven settings are excluded so lockfiles stay portable.
+- `angra resolve --frozen` installs exactly the locked artifacts (no metadata lookups, no graph traversal, never rewrites the lock) and verifies every artifact against its locked SHA-256 — including cached files, a deliberate frozen-only exception to the warm-cache no-reverify rule. Locked `pom_path`/`artifact_path` are informational; frozen recomputes paths from coordinates against the current local repo.
 
 ## Repository And Config Decisions
 
@@ -150,15 +155,15 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Auth implementation (Maven `<servers>`, credentials, tokens) and proxies are not implemented. Auth errors are diagnosed with actionable messages.
 - Snapshot timestamp/build-number resolution and Maven version ranges are implemented for resolver metadata selection.
 - Maven profile support is resolver-focused, not a full Maven build-model/plugin compatibility layer.
-- Source `pom.xml` ingestion remains separate from artifact/POM resolution.
+- Source `pom.xml` ingestion is now a one-way 0.3 `import-pom` migration path, not live POM-as-manifest execution.
 - Maven plugin execution is deferred as an adoption gate, not part of the 1.0 inner-loop replacement.
 - The measured JVM worker spike belongs in the 0.4 compile/test milestone; do not commit to a persistent daemon before benchmarks justify it.
 
 ## Next Priorities
 
-- Capture the user's pending caveat before starting 0.3.
-- Begin 0.3 manifest lifecycle from a clean 0.2 base.
-- Implement manifest-editing commands conservatively: `init`, `add`, `remove`, `lock`, `tree`, `why`, `import-pom`, and read-only workspace primitives.
+- Finish 0.3 validation and polish for migration-first manifest lifecycle.
+- Keep `import-pom` effective and concrete while warning for Maven build/plugin/reporting/publishing behavior that Angra does not model.
+- Preserve lockfile artifact-only semantics; `tree` and `why` use in-memory resolver graph data, not persisted provenance.
 - Keep tests, clippy, formatting, and benchmark coverage aligned with any CLI or manifest behavior change.
 
 ## Shipped Milestone Notes
@@ -195,3 +200,27 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - **What was decided:** Reopened the Tokio question and deferred the call until angra accumulates a real async workload (e.g. concurrent background indexer, watch-mode resolver, or live registry streaming). Re-evaluation trigger: a concrete async-shaped feature lands in the roadmap.
 - **Why:** Current `thread::scope` + `mpsc` work-queue in `Resolver::ensure_artifacts_parallel` already hits the 5.7x-over-Maven target, and the blocking `reqwest` path has no measured cold-network pain. Adopting Tokio now would add compile-time and dependency weight without a clear bottleneck to solve.
 - **Rejected and why:** Adopting Tokio speculatively (ahead of an async feature) was rejected because it would couple the project to a runtime before a real driver exists, mirroring the 0.2 rejection at MEMORY.md:185. Switching only the parallel-fetch loop to async was rejected for now because it would split the codebase into two concurrency styles with no measured benefit.
+
+## Decision Entry - 2026-06-09 (Outdated Command)
+
+- **What was decided:** `angra outdated` reports direct dependencies with newer versions from configured repositories via the existing `maven-metadata.xml` machinery. Read-only: no manifest or lockfile writes. Version ranges and SNAPSHOT declarations are skipped with a warning (they update through `angra lock`); SNAPSHOT versions are excluded when computing "latest"; exit code stays 0 since the command is informational. Resolver construction was deduplicated into a `project_resolver` helper shared by resolve, frozen, and outdated paths.
+- **Why:** The dependency-upgrade story starts with visibility; `outdated` builds the metadata-querying surface that a future `angra update` reuses. Maven-style version ordering (`MavenVersion`) was already implemented for ranges.
+- **Rejected and why:** Recommending SNAPSHOT versions as "latest" was rejected — release pins should not be nudged toward snapshots. A non-zero exit for outdated deps (npm-style) was rejected for now; can be revisited with a `--check` flag if CI gating is wanted. `angra update` itself was descoped from this session by explicit instruction.
+
+## Decision Entry - 2026-06-09 (Frozen Resolve Implementation)
+
+- **What was decided:** Implemented `angra resolve --frozen` as the lockfile-authoritative CI install path. Drift detection uses a new optional `manifest_fingerprint` field in `angra.lock`: SHA-256 over a versioned canonical rendering of resolver-relevant manifest intent (declared dependencies, dependency management, project repositories with policies, `[resolver.maven]` controls), computed from parsed declarations rather than raw TOML. Frozen mode skips all version/metadata resolution, fetches missing locked artifacts through the existing repository machinery, verifies every artifact (cached or downloaded) against its locked SHA-256, never rewrites the lockfile, and `--frozen` conflicts with `--refresh` at the CLI.
+- **Why:** Without an authoritative-lock mode the lockfile is informational; CI needs "install the lock, fail loudly on drift". Hashing parsed intent keeps formatting/comment edits from invalidating locks, and equivalent compact/structured declarations fingerprint identically. Excluding global config and settings.xml keeps lockfiles portable across machines.
+- **Rejected and why:** Hashing raw manifest text was rejected (false drift on cosmetic edits). Checking that each declared root appears in the lock was rejected (cannot detect removals without provenance). Recording declared roots in the lockfile was rejected as a larger format change than needed. Two logged decisions were touched deliberately: the fingerprint is an input digest, not resolver provenance, so the artifact-only lockfile decision stands; and frozen mode re-verifies cached artifact hashes as an explicit, opt-in exception to the warm-cache no-reverify rule — normal `resolve`/`lock` behavior is unchanged.
+
+## Decision Entry - 2026-06-09 (Roadmap Review Additions)
+
+- **What was decided:** After a roadmap review: (1) lockfile-driven installs (`angra resolve --frozen`), `angra outdated`, `angra update [alias]`, and explicit workspace-root resolve semantics were added to 0.3 scope, with permission to split `update`/`outdated` into a named 0.3.x if they would block shipping; (2) basic test/clippy/fmt CI was pulled forward from 1.0 into 0.3; (3) scoped classpath construction (compile/`provided`, test-compile, test-runtime with Maven scope inheritance) and `angra test --filter` were added to 0.4 scope; (4) a new 0.6 milestone covers private-repository basic auth from `settings.xml` `<servers>` plus env-var credential references, moved up from the deferred Maven long tail; (5) `--json` output for `tree`/`why` joined the 1.0 CLI UX bullet; (6) Windows support became an explicit deferral past 1.0.
+- **Why:** Lockfile-authoritative installs and a dependency-upgrade story are core uv ergonomics that were absent from the path. Private-repo auth is the biggest corporate adoption gate after plugin execution, and 1.0 is "no new capabilities", so auth needed its own pre-1.0 milestone. CI at 1.0 was too late given the per-milestone verification protocol already depends on those checks. The compile/test classpath split is resolver work that was invisible in the 0.4 bullets. Windows was the only platform question the roadmap was silent on.
+- **Rejected and why:** Folding auth into 1.0 hardening was rejected because it contradicts 1.0's no-new-capabilities framing. Encrypted `settings-security.xml`, proxies, and token schemes stay deferred to keep 0.6 small. Committing to Windows CI/binaries now was rejected as a conscious cut pending adoption interest; nothing in the codebase blocks it later.
+
+## Decision Entry - 2026-06-09 (0.3 Migration-First Start)
+
+- **What was decided:** Started 0.3 as a Maven migration-first milestone. `import-pom` generates effective concrete TOML, records Maven modules as read-only `[workspace] members`, and warns for Maven build/plugin/reporting/publishing behavior rather than guessing.
+- **Why:** Existing Java projects are the likely adoption path; a useful importer reduces migration friction while preserving Angra's low-ceremony TOML surface.
+- **Rejected and why:** Source-shaped XML mirroring was rejected because it would carry Maven ceremony into Angra. Persisting resolver provenance in `angra.lock` was rejected to preserve the artifact-only lockfile decision; `tree` and `why` use in-memory graph data instead. Importing relative-only parent POMs as BOM imports was rejected because those parents are not repository-resolvable from `angra.toml`; Angra warns and keeps concrete dependencies instead.

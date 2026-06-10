@@ -1,4 +1,5 @@
 pub mod benchmark;
+pub mod commands;
 pub mod config;
 pub mod lockfile;
 pub mod manifest;
@@ -8,4 +9,4 @@ mod pom;
 pub mod resolver;
 pub mod settings;
 
-pub use resolver::{ResolveError, ResolveOptions, resolve_project};
+pub use resolver::{ResolveError, ResolveOptions, inspect_project, resolve_project};

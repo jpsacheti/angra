@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -16,11 +16,11 @@ use crate::{
     lockfile::{LockedArtifact, Lockfile, LockfileError},
     manifest::{
         DeclaredDependency, DeclaredManagedDependency, ManagedDependencyScope, Manifest,
-        ManifestError,
+        ManifestError, Project, WritableManifest, unique_alias,
     },
     maven::{
-        ArtifactCoordinate, ArtifactIdentity, ArtifactType, ChecksumPolicy, Coordinate, Repository,
-        RepositoryPolicy, Scope, VersionRange,
+        ArtifactCoordinate, ArtifactIdentity, ArtifactType, ChecksumPolicy, Coordinate,
+        MavenVersion, Repository, RepositoryPolicy, Scope, VersionRange,
     },
     metadata::MavenMetadata,
     pom::{EffectivePom, ManagedDependency, Pom, PomError, ProfileActivationContext},
@@ -36,9 +36,82 @@ pub struct ResolveOptions {
 }
 
 #[derive(Debug, Clone)]
+pub struct PomImportOptions {
+    pub pom_path: PathBuf,
+    pub offline: bool,
+    pub refresh: bool,
+    pub local_repo: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PomImportOutput {
+    pub manifest: WritableManifest,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResolveOutput {
     pub lockfile: Lockfile,
+    pub graph: ResolutionGraph,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolutionGraph {
+    pub artifacts: Vec<ResolvedGraphArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGraphArtifact {
+    pub artifact: ArtifactCoordinate,
+    pub scope: Scope,
+    pub depth: usize,
+    pub path: Vec<ArtifactCoordinate>,
+}
+
+impl ResolutionGraph {
+    fn from_artifacts(artifacts: &[ResolvedArtifact]) -> Self {
+        let mut artifacts = artifacts
+            .iter()
+            .map(|artifact| ResolvedGraphArtifact {
+                artifact: artifact.artifact.clone(),
+                scope: artifact.scope,
+                depth: artifact.depth,
+                path: artifact.path.clone(),
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| {
+            left.path
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .cmp(
+                    &right
+                        .path
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                )
+                .then_with(|| left.artifact.cmp(&right.artifact))
+        });
+        Self { artifacts }
+    }
+
+    pub fn path_to(
+        &self,
+        group: &str,
+        artifact: &str,
+        version: Option<&str>,
+    ) -> Option<&[ArtifactCoordinate]> {
+        self.artifacts
+            .iter()
+            .find(|entry| {
+                entry.artifact.coordinate.group == group
+                    && entry.artifact.coordinate.artifact == artifact
+                    && version.is_none_or(|version| entry.artifact.coordinate.version == version)
+            })
+            .map(|entry| entry.path.as_slice())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +130,7 @@ struct ResolvedArtifact {
     requested_version: Option<String>,
     scope: Scope,
     depth: usize,
+    path: Vec<ArtifactCoordinate>,
     pom_path: PathBuf,
     artifact_path: PathBuf,
     source: String,
@@ -95,10 +169,128 @@ struct ResolvedArtifactVersion {
 }
 
 pub fn resolve_project(options: ResolveOptions) -> Result<ResolveOutput, ResolveError> {
+    resolve_project_inner(options, true)
+}
+
+pub fn inspect_project(options: ResolveOptions) -> Result<ResolveOutput, ResolveError> {
+    resolve_project_inner(options, false)
+}
+
+#[derive(Debug, Clone)]
+pub struct FrozenResolveOutput {
+    pub lockfile: Lockfile,
+    pub warnings: Vec<String>,
+}
+
+/// Install exactly what `angra.lock` records, without re-resolving.
+///
+/// The lockfile is authoritative: the manifest fingerprint must match, every
+/// locked artifact is fetched at its locked concrete version (no metadata
+/// lookups, no graph traversal), and artifact contents must match the locked
+/// SHA-256. The lockfile is never rewritten.
+pub fn resolve_frozen_project(
+    options: ResolveOptions,
+) -> Result<FrozenResolveOutput, ResolveError> {
+    let manifest_path = options.project_dir.join("angra.toml");
+    let manifest = Manifest::read(&manifest_path)?;
+    let lock_path = options.project_dir.join("angra.lock");
+    if !lock_path.exists() {
+        return Err(ResolveError::FrozenMissingLockfile(lock_path));
+    }
+    let lockfile = Lockfile::read(&lock_path)?;
+    if lockfile.version != 1 {
+        return Err(ResolveError::FrozenUnsupportedLockfile(lockfile.version));
+    }
+    let fingerprint = manifest.resolver_fingerprint()?;
+    if lockfile.manifest_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+        return Err(ResolveError::FrozenManifestDrift);
+    }
+
+    let resolver = project_resolver(&manifest, &options)?;
+
+    for locked in &lockfile.artifacts {
+        resolver.ensure_frozen_artifact(locked)?;
+    }
+
+    let warnings = resolver.into_warnings();
+    Ok(FrozenResolveOutput { lockfile, warnings })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutdatedStatus {
+    UpToDate,
+    Outdated { latest: String },
+    Skipped { reason: String },
+    NoMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutdatedReport {
+    pub alias: String,
+    pub artifact: ArtifactCoordinate,
+    pub status: OutdatedStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutdatedOutput {
+    pub reports: Vec<OutdatedReport>,
+    pub warnings: Vec<String>,
+}
+
+/// Report direct dependencies with newer versions available from configured
+/// repositories. Read-only: neither the manifest nor the lockfile is touched.
+pub fn outdated_project(options: ResolveOptions) -> Result<OutdatedOutput, ResolveError> {
     let manifest_path = options.project_dir.join("angra.toml");
     let manifest = Manifest::read(&manifest_path)?;
     let dependencies = manifest.declared_dependencies()?;
-    let dependency_management = manifest.declared_dependency_management()?;
+    let resolver = project_resolver(&manifest, &options)?;
+
+    let mut reports = Vec::new();
+    for dependency in dependencies {
+        let current = &dependency.artifact.coordinate.version;
+        let status = if VersionRange::is_range_spec(current) {
+            OutdatedStatus::Skipped {
+                reason: "version ranges resolve to the newest matching version on each lock"
+                    .to_string(),
+            }
+        } else if dependency.artifact.coordinate.is_snapshot() {
+            OutdatedStatus::Skipped {
+                reason: "SNAPSHOT versions update in place".to_string(),
+            }
+        } else {
+            let versions = resolver
+                .metadata_versions(&dependency.artifact.coordinate, &resolver.repositories)?;
+            match newest_release_version(&versions) {
+                None => OutdatedStatus::NoMetadata,
+                Some(latest) if MavenVersion::new(&latest) > MavenVersion::new(current) => {
+                    OutdatedStatus::Outdated { latest }
+                }
+                Some(_) => OutdatedStatus::UpToDate,
+            }
+        };
+        reports.push(OutdatedReport {
+            alias: dependency.alias,
+            artifact: dependency.artifact,
+            status,
+        });
+    }
+
+    let warnings = resolver.into_warnings();
+    Ok(OutdatedOutput { reports, warnings })
+}
+
+fn newest_release_version(versions: &[String]) -> Option<String> {
+    versions
+        .iter()
+        .filter(|version| !version.ends_with("-SNAPSHOT"))
+        .max_by(|left, right| MavenVersion::new(left).cmp(&MavenVersion::new(right)))
+        .cloned()
+}
+
+fn project_resolver(
+    manifest: &Manifest,
+    options: &ResolveOptions,
+) -> Result<Resolver, ResolveError> {
     let global_config = GlobalConfig::load()?;
     let settings = MavenSettings::load()?;
     let mut activation_properties = settings.properties.clone();
@@ -115,22 +307,215 @@ pub fn resolve_project(options: ResolveOptions) -> Result<ResolveOutput, Resolve
     settings.apply_mirrors(&mut repositories);
     let local_repo = options
         .local_repo
+        .clone()
         .or(settings.local_repository.clone())
         .map(Ok)
         .unwrap_or_else(default_local_repo)?;
-    let resolver = Resolver::new_with_activation(
+    Resolver::new_with_activation(
         local_repo,
         repositories,
-        settings.clone(),
+        settings,
+        profile_activation,
+        options.offline,
+        options.refresh,
+    )
+}
+
+pub fn import_pom(options: PomImportOptions) -> Result<PomImportOutput, ResolveError> {
+    let pom_path = options.pom_path;
+    let project_dir = pom_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let global_config = GlobalConfig::load()?;
+    let settings = MavenSettings::load()?;
+    let mut repositories =
+        baseline_repositories(&global_config.repositories(), &settings.repositories);
+    settings.apply_mirrors(&mut repositories);
+    let local_repo = options
+        .local_repo
+        .or(settings.local_repository.clone())
+        .map(Ok)
+        .unwrap_or_else(default_local_repo)?;
+    let profile_activation = ProfileActivationContext::new(
+        Vec::<String>::new(),
+        Vec::<String>::new(),
+        settings.properties.clone(),
+        None,
+        project_dir,
+    );
+    let resolver = Resolver::new_with_activation(
+        local_repo,
+        repositories.clone(),
+        settings,
         profile_activation,
         options.offline,
         options.refresh,
     )?;
+
+    let raw = Pom::read(&pom_path)?;
+    let active_raw = raw.active_model(&resolver.profile_activation);
+    let source = pom_path.display().to_string();
+    let effective = resolver.effective_pom_from_path(&pom_path, &repositories, &mut Vec::new())?;
+    let properties = effective.property_context();
+    let mut warnings = import_warnings(&raw, &source);
+
+    let mut dependency_management = Vec::new();
+    let mut used_management_aliases = BTreeSet::new();
+    if let Some(parent) = raw.parent_coordinate(&source)? {
+        let parent_artifact = ArtifactCoordinate::pom(parent);
+        if parent_artifact.pom_path(&resolver.local_repo).exists() {
+            let alias = unique_alias(
+                &mut used_management_aliases,
+                &parent_artifact.coordinate.group,
+                &parent_artifact.coordinate.artifact,
+            );
+            dependency_management.push(DeclaredManagedDependency {
+                alias,
+                artifact: parent_artifact,
+                scope: ManagedDependencyScope::Import,
+                exclusions: Vec::new(),
+            });
+        } else {
+            warnings.push(format!(
+                "did not import parent POM `{}` because it was only available through Maven relativePath",
+                parent_artifact.coordinate
+            ));
+        }
+    }
+
+    for dependency in active_raw.dependency_management_entries() {
+        if let Some(scope) = dependency.unsupported_scope() {
+            warnings.push(format!(
+                "skipped dependency-management entry with unsupported Maven scope `{scope}`"
+            ));
+            continue;
+        }
+
+        if dependency.is_bom_import() {
+            let Some(coordinate) = dependency.coordinate(&properties, &source)? else {
+                warnings.push(
+                    "skipped dependency-management BOM import without a complete coordinate"
+                        .to_string(),
+                );
+                continue;
+            };
+            let alias = unique_alias(
+                &mut used_management_aliases,
+                &coordinate.group,
+                &coordinate.artifact,
+            );
+            dependency_management.push(DeclaredManagedDependency {
+                alias,
+                artifact: ArtifactCoordinate::pom(coordinate),
+                scope: ManagedDependencyScope::Import,
+                exclusions: Vec::new(),
+            });
+            continue;
+        }
+
+        let Some((identity, managed)) = dependency.managed_dependency(&properties, &source)? else {
+            warnings.push(
+                "skipped dependency-management entry without a complete coordinate".to_string(),
+            );
+            continue;
+        };
+        let Some(version) = managed.version else {
+            warnings.push(format!(
+                "skipped dependency-management entry `{}:{}` without a concrete version",
+                identity.group, identity.artifact
+            ));
+            continue;
+        };
+        let alias = unique_alias(
+            &mut used_management_aliases,
+            &identity.group,
+            &identity.artifact,
+        );
+        dependency_management.push(DeclaredManagedDependency {
+            alias,
+            artifact: ArtifactCoordinate::new(
+                Coordinate::new(&identity.group, &identity.artifact, &version),
+                identity.artifact_type,
+                identity.classifier,
+            ),
+            scope: managed
+                .scope
+                .map(ManagedDependencyScope::Graph)
+                .unwrap_or_default(),
+            exclusions: managed.exclusions,
+        });
+    }
+
+    let mut dependencies = Vec::new();
+    let mut used_dependency_aliases = BTreeSet::new();
+    for dependency in &effective.dependencies {
+        if let Some(scope) = dependency.unsupported_scope() {
+            warnings.push(format!(
+                "skipped dependency with unsupported Maven scope `{scope}`"
+            ));
+            continue;
+        }
+        if dependency.is_optional() {
+            warnings.push(
+                "imported optional Maven dependency as a normal Angra dependency".to_string(),
+            );
+        }
+
+        let Some(resolved) =
+            dependency.resolve(&properties, &source, &effective.dependency_management)?
+        else {
+            warnings.push("skipped dependency without a complete concrete coordinate".to_string());
+            continue;
+        };
+        let alias = unique_alias(
+            &mut used_dependency_aliases,
+            &resolved.artifact.coordinate.group,
+            &resolved.artifact.coordinate.artifact,
+        );
+        dependencies.push(DeclaredDependency {
+            alias,
+            artifact: resolved.artifact,
+            scope: resolved.scope,
+            exclusions: resolved.exclusions,
+        });
+    }
+
+    warnings.extend(resolver.into_warnings());
+
+    Ok(PomImportOutput {
+        manifest: WritableManifest {
+            project: Some(Project {
+                group: effective.group_id,
+                artifact: effective.artifact_id,
+                version: effective.version,
+            }),
+            workspace_members: raw.modules().to_vec(),
+            repositories: effective.repositories,
+            dependency_management,
+            dependencies,
+        },
+        warnings,
+    })
+}
+
+fn resolve_project_inner(
+    options: ResolveOptions,
+    write_lockfile: bool,
+) -> Result<ResolveOutput, ResolveError> {
+    let manifest_path = options.project_dir.join("angra.toml");
+    let manifest = Manifest::read(&manifest_path)?;
+    let manifest_fingerprint = manifest.resolver_fingerprint()?;
+    let dependencies = manifest.declared_dependencies()?;
+    let dependency_management = manifest.declared_dependency_management()?;
+    let resolver = project_resolver(&manifest, &options)?;
     let artifacts =
         resolver.resolve_with_dependency_management(dependencies, dependency_management)?;
     let warnings = resolver.into_warnings();
+    let graph = ResolutionGraph::from_artifacts(&artifacts);
 
     let lockfile = Lockfile::new(
+        Some(manifest_fingerprint),
         artifacts
             .into_iter()
             .map(|artifact| {
@@ -148,8 +533,14 @@ pub fn resolve_project(options: ResolveOptions) -> Result<ResolveOutput, Resolve
             .collect::<Result<Vec<_>, ResolveError>>()?,
     );
 
-    lockfile.write_if_changed(&options.project_dir.join("angra.lock"))?;
-    Ok(ResolveOutput { lockfile, warnings })
+    if write_lockfile {
+        lockfile.write_if_changed(&options.project_dir.join("angra.lock"))?;
+    }
+    Ok(ResolveOutput {
+        lockfile,
+        graph,
+        warnings,
+    })
 }
 
 struct Resolver {
@@ -297,6 +688,7 @@ impl Resolver {
                         requested_version: fetched.requested_version.clone(),
                         scope: item.scope,
                         depth: item.depth,
+                        path: item.path.clone(),
                         pom_path: fetched.artifact.pom_path(&self.local_repo),
                         artifact_path: fetched.artifact.artifact_path(&self.local_repo),
                         source: fetched.source,
@@ -684,6 +1076,51 @@ impl Resolver {
             requested_version: resolved.requested_version,
             source,
         })
+    }
+
+    /// Ensure a locked artifact is present locally and matches its locked SHA-256.
+    ///
+    /// Unlike `ensure_artifact`, the locked version is final: no range or
+    /// SNAPSHOT metadata resolution happens here. Cached files are verified
+    /// too — frozen mode is the integrity gate, so it pays the hash cost that
+    /// normal warm-cache resolution skips.
+    fn ensure_frozen_artifact(&self, locked: &LockedArtifact) -> Result<(), ResolveError> {
+        let artifact = locked.artifact_coordinate();
+        let pom_path = artifact.pom_path(&self.local_repo);
+        let artifact_path = artifact.artifact_path(&self.local_repo);
+        let descriptor_only =
+            artifact.artifact_type == ArtifactType::Pom && artifact.classifier.is_none();
+
+        if !(pom_path.exists() && (descriptor_only || artifact_path.exists())) {
+            if self.offline {
+                return Err(ResolveError::OfflineMissing(artifact.to_string()));
+            }
+
+            self.download_artifact(
+                &artifact,
+                locked.requested_version.as_deref(),
+                &self.repositories,
+                &pom_path,
+                &artifact_path,
+                descriptor_only,
+            )?;
+        }
+
+        let Some(expected) = locked.artifact_sha256.as_deref() else {
+            return Err(ResolveError::FrozenMissingChecksum {
+                artifact: artifact.to_string(),
+            });
+        };
+        let actual = sha256_file(&artifact_path)?;
+        if actual != expected {
+            return Err(ResolveError::FrozenChecksumMismatch {
+                artifact: artifact.to_string(),
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+
+        Ok(())
     }
 
     fn resolve_artifact_version(
@@ -1085,6 +1522,54 @@ fn drain_depth_batch(
     batch
 }
 
+fn baseline_repositories(global: &[Repository], settings: &[Repository]) -> Vec<Repository> {
+    if global.is_empty() && settings.is_empty() {
+        return vec![Repository::maven_central()];
+    }
+
+    let mut repositories = global.to_vec();
+    for repository in settings {
+        if !repositories
+            .iter()
+            .any(|existing| existing.name == repository.name)
+        {
+            repositories.push(repository.clone());
+        }
+    }
+    repositories
+}
+
+fn import_warnings(raw: &Pom, source: &str) -> Vec<String> {
+    let mut warnings = vec![format!(
+        "import-pom is a one-way migration from `{source}`; Maven build/plugin behavior is not imported"
+    )];
+
+    if let Some(packaging) = raw.packaging()
+        && packaging != "jar"
+    {
+        warnings.push(format!(
+            "Maven packaging `{packaging}` is not modeled by 0.3 manifest import"
+        ));
+    }
+    if raw.has_build_section() {
+        warnings.push("ignored Maven <build> configuration and plugins".to_string());
+    }
+    if raw.has_reporting_section() {
+        warnings.push("ignored Maven <reporting> configuration".to_string());
+    }
+    if raw.has_distribution_management_section() {
+        warnings.push("ignored Maven <distributionManagement> publishing metadata".to_string());
+    }
+    if !raw.modules().is_empty() {
+        warnings.push(
+            "wrote Maven <modules> as read-only [workspace] members; orchestration arrives later"
+                .to_string(),
+        );
+    }
+
+    warnings
+}
+
 fn default_local_repo() -> Result<PathBuf, ResolveError> {
     let home = dirs::home_dir().ok_or(ResolveError::MissingHome)?;
     Ok(home.join(".m2").join("repository"))
@@ -1274,6 +1759,26 @@ pub enum ResolveError {
     MissingHome,
     #[error("artifact `{0}` is missing locally and --offline was used")]
     OfflineMissing(String),
+    #[error("`angra.lock` was not found at `{0}`; run `angra lock` before resolving with --frozen")]
+    FrozenMissingLockfile(PathBuf),
+    #[error("unsupported `angra.lock` version {0}; run `angra lock` to regenerate it")]
+    FrozenUnsupportedLockfile(u32),
+    #[error(
+        "`angra.toml` has changed since `angra.lock` was written (or the lockfile predates --frozen support); run `angra lock` to update it"
+    )]
+    FrozenManifestDrift,
+    #[error(
+        "artifact `{artifact}` has no recorded checksum in `angra.lock`; run `angra lock` to regenerate it"
+    )]
+    FrozenMissingChecksum { artifact: String },
+    #[error(
+        "artifact `{artifact}` does not match `angra.lock`: expected sha256 `{expected}`, found `{actual}`; run `angra lock` if this change is intentional"
+    )]
+    FrozenChecksumMismatch {
+        artifact: String,
+        expected: String,
+        actual: String,
+    },
     #[error("artifact `{artifact}` was not found in configured repositories {repositories:?}")]
     ArtifactNotFound {
         artifact: String,
@@ -1370,6 +1875,19 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn newest_release_version_orders_maven_style_and_skips_snapshots() {
+        let versions =
+            ["1.0.0", "1.10.0", "1.9.0", "2.0.0-SNAPSHOT", "1.10.0-rc1"].map(String::from);
+
+        assert_eq!(
+            newest_release_version(&versions),
+            Some("1.10.0".to_string())
+        );
+        assert_eq!(newest_release_version(&[]), None);
+        assert_eq!(newest_release_version(&["1.0-SNAPSHOT".to_string()]), None);
+    }
     use crate::manifest::DeclaredDependency;
 
     fn write_artifact(repo: &Path, coordinate: &Coordinate, pom_body: &str) {

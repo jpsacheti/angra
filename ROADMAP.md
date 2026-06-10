@@ -4,8 +4,8 @@ Angra aims to be a fast, Maven-compatible Java project tool — `uv` ergonomics 
 
 This roadmap covers milestones **0.1 through 1.0**, ending at a usable replacement for everyday Maven workflows (resolve, add deps, build, test, run, package). The core architecture is a Rust driver that keeps normal CLI operations JVM-free, spawning Java only when compilation, tests, runtime execution, or future plugin compatibility require it. Publishing, built-in JDK management, IDE plugins, Maven plugin execution, and the long tail of Maven feature parity are deferred — see the [Deferred](#deferred) section. The decision log lives in [MEMORY.md](MEMORY.md).
 
-- **Last updated:** 2026-06-02 (0.2 closure)
-- **Current milestone:** 0.3 (planned — ready to begin)
+- **Last updated:** 2026-06-09 (roadmap review: frozen installs + update/outdated in 0.3, CI pulled forward, classpath split in 0.4, new 0.6 private-repo auth, Windows explicitly deferred)
+- **Current milestone:** 0.3 (in progress — migration-first manifest lifecycle)
 
 ## Status legend
 
@@ -59,7 +59,7 @@ In `master` today:
 
 ---
 
-## 0.3 — Manifest lifecycle **[planned]**
+## 0.3 — Manifest lifecycle **[in progress]**
 
 **Goal:** Make `angra.toml` editable through commands the way `uv` edits `pyproject.toml`. After 0.3 a developer can start fresh, add/remove deps, inspect the graph, and migrate from Maven without ever hand-editing the manifest.
 
@@ -69,15 +69,21 @@ In `master` today:
 - `angra add <coord> [--scope=runtime|test|provided]` — append, re-resolve, update lockfile.
 - `angra remove <alias>` — remove, re-resolve.
 - `angra lock` — re-resolve without manifest changes.
+- Lockfile-driven installs: `angra resolve --frozen` treats `angra.lock` as authoritative — fetch exactly the locked artifacts with no re-resolution, and fail loudly if the lockfile is missing or out of sync with the manifest. This is the CI entry point; without it the lockfile is informational rather than authoritative.
+- `angra outdated` — report direct dependencies with newer versions available from configured repositories (reuses `maven-metadata.xml` support from 0.2). Read-only.
+- `angra update [alias]` — re-resolve one or all direct dependencies to the newest available version, rewriting manifest and lockfile.
+- Workspace-root semantics: define and document what `resolve`/`lock`/`tree`/`why` do when run at a workspace root in 0.3 — a clear error pointing at members is acceptable, silence is not.
+- Basic CI, pulled forward from 1.0: GitHub Actions running `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets -- -D warnings` on every PR. Bench-on-PR stays in 1.0.
 - `angra tree` — print resolved graph.
 - `angra why <coord>` — print the path that brought a coord in (reuses path-tracking from 0.2).
 - `angra import-pom <path>` — one-way migration from existing `pom.xml`. Lossy by design; flagged in output.
+- Migration-first caveat: `import-pom` produces effective, concrete TOML from Maven properties, parents, dependency management, BOM imports, repositories, and resolver-relevant active profiles where Angra can model them. Maven build/plugin/reporting/publishing behavior is warned as lossy rather than guessed.
 - Workspace primitive: `[workspace] members = [...]`. Read-only at this stage — orchestration arrives in 0.4.
 - Strict manifest mode: keep `angra.toml` simpler than Maven XML, but preserve enough information to round-trip dependency intent back to Maven-compatible behavior.
 
-**Critical files:** `src/main.rs` (subcommands), likely a new `src/commands/` module tree, `src/manifest.rs` (writer in addition to current reader), new `src/workspace.rs`.
+**Critical files:** `src/main.rs` (subcommands), `src/commands.rs` (command orchestration), `src/manifest.rs` (writer in addition to current reader), `src/resolver.rs` and `src/pom.rs` (effective POM import and graph inspection).
 
-**Exit criteria:** A developer can `angra init`, `angra add com.google.guava:guava:33.0.0-jre`, `angra add junit:junit:4.13.2 --scope=test`, `angra tree`, `angra why com.google.guava:guava` — all without opening the TOML. `angra import-pom` on the bench `pom.xml` fixtures produces an equivalent `angra.toml`.
+**Exit criteria:** A developer can `angra init`, `angra add com.google.guava:guava:33.0.0-jre`, `angra add junit:junit:4.13.2 --scope=test`, `angra tree`, `angra why com.google.guava:guava` — all without opening the TOML. `angra import-pom` on the bench `pom.xml` fixtures produces an equivalent `angra.toml`. `angra resolve --frozen` succeeds on a clean checkout with a committed lockfile and fails on manifest drift. CI is green on `master`. If `update`/`outdated` would block an otherwise-done milestone, split them to a named 0.3.x follow-up rather than shipping them half-baked — but do not drop them silently.
 
 ---
 
@@ -89,9 +95,11 @@ In `master` today:
 
 - `[toolchain] jdk = "21"` in `angra.toml`. Angra invokes `mise x java@21 -- javac ...` with SDKMan fallback. Clear error if neither tool is installed.
 - Rust driver orchestrates build steps and passes minimal context to Java tools; no embedded JVM in the CLI.
+- Scoped classpath construction in the resolver: distinct compile (`compile` + `provided`), test-compile, and test-runtime classpaths with Maven scope-inheritance rules for transitives. Today's resolver produces a runtime set — this is real resolver work, not just build orchestration, and it gates everything else in this milestone.
 - Conventional source layout: `src/main/java`, `src/test/java`, `src/main/resources`, `src/test/resources` — overridable in `[build]`.
 - `angra build` — compile `src/main/java` against the resolved compile classpath, output to `target/classes`.
 - `angra test` — compile `src/test/java`, then run JUnit 5 via `org.junit.platform.console.ConsoleLauncher` (auto-added to test scope). Non-zero exit on failure.
+- Test selection: `angra test --filter <pattern>` mapping to ConsoleLauncher class/method selectors. Whole-suite-only runs undercut the inner-loop goal more than raw speed gains it.
 - `angra clean` — wipe `target/`.
 - Incremental compile: skip `javac` when no `.java` source is newer than its `.class` output. Coarse per-module is fine.
 - Annotation processors: `[build] annotation-processors = ["org.projectlombok:lombok:1.18.34"]` → `-processorpath`. Required for Lombok/MapStruct.
@@ -123,6 +131,23 @@ In `master` today:
 
 ---
 
+## 0.6 — Private repositories **[planned]**
+
+**Goal:** Make Angra usable inside a typical workplace: dependencies fronted by Artifactory/Nexus behind credentials. Previously deferred as Maven long tail, but the corporate adoption path dies at the first 401 — and 1.0 is explicitly "no new capabilities", so this lands before it.
+
+**Scope:**
+
+- HTTP basic auth for repository fetches, sourced from `~/.m2/settings.xml` `<servers>` (plain-text values only).
+- Angra-native credentials: environment-variable references in repository config. No secrets written to `angra.toml` or the global config file.
+- Auth-aware diagnostics: extend the existing `AuthenticationRequired` error to name the repository and which server id matched (or that none did).
+- Encrypted `settings-security.xml`, proxies, and token-exchange schemes remain deferred.
+
+**Critical files:** `src/settings.rs` (`<servers>` parsing), `src/maven.rs` (authenticated fetch), `src/config.rs` (env-var credential references).
+
+**Exit criteria:** A fixture repository behind basic auth resolves with credentials from `settings.xml` and from env-var config. A wrong-credential run produces an actionable error naming the repository and server id.
+
+---
+
 ## 1.0 — Hardening **[planned]**
 
 **Goal:** What's shipped is reliable, documented, and packaged. No new capabilities — purely about earning the version number.
@@ -131,12 +156,12 @@ In `master` today:
 
 - `angra.lock` format frozen; documented compatibility policy.
 - Error message audit — every error variant gives an actionable next step.
-- CLI UX consistency: `--help` for every subcommand, consistent flag naming, documented exit codes.
+- CLI UX consistency: `--help` for every subcommand, consistent flag naming, documented exit codes, and machine-readable `--json` output for `tree` and `why` (scripting/CI consumers; shipping this for the first time post-1.0 would be odd).
 - Documentation: real `docs/` with per-command pages and a Maven migration guide.
 - Bench fixtures expanded: spring-boot-starter-web, jackson, netty, a 100-dep stress fixture. Summary in README.
 - Performance budget documented: resolver benchmarks must report Angra vs Maven vs Gradle speedups, and existing warm-cache fixtures must not regress without explanation.
-- CI: GitHub Actions running `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, bench on every PR (non-gating).
-- Prebuilt binaries: macOS arm64/x86_64, Linux x86_64/arm64. Homebrew tap.
+- CI: bench harness on every PR (non-gating), on top of the test/clippy/fmt pipeline pulled forward into 0.3.
+- Prebuilt binaries: macOS arm64/x86_64, Linux x86_64/arm64. Homebrew tap. Windows is an explicit deferral (see [Deferred](#deferred)), not an oversight.
 - Resolver edge-case bug bash: empty POMs, malformed POMs, cycles, large fan-out, classifier collisions.
 
 **Critical files:** `.github/workflows/`, `docs/`, `README.md`, `CONTRIBUTING.md`. No new source modules.
@@ -153,7 +178,8 @@ Intentionally not on the 0.1 → 1.0 path:
 - **Built-in JDK management**: delegation to `mise` / SDKMan is the long-term answer through 1.0.
 - **Persistent JVM daemon**: a warm background JVM may be needed for excellent repeated compile/test performance, but it should follow measured 0.4 worker results rather than become baseline complexity.
 - **IDE integration**: IntelliJ plugin, LSP server, Eclipse `.classpath` export beyond `angra tree --machine-readable`.
-- **Maven feature parity (long tail)**: mirrors with auth, encrypted `settings-security.xml`, full Maven build/plugin model behavior, and edge-case profile/build-model semantics beyond resolver-relevant POM sections.
+- **Maven feature parity (long tail)**: encrypted `settings-security.xml`, proxies, full Maven build/plugin model behavior, and edge-case profile/build-model semantics beyond resolver-relevant POM sections. (Basic repository auth from `<servers>` moved up to 0.6.)
+- **Windows support**: config-directory handling is already platform-aware, but Windows CI, testing, and prebuilt binaries stay out of the 1.0 path. A conscious cut, not an oversight — Java's audience is Windows-heavy, so revisit when adoption interest shows up; nothing in the codebase blocks it.
 - **Maven plugin execution**: arbitrary `<build><plugins>` from imported POMs. This is the major adoption gate for replacing Maven in plugin-heavy builds. Through 1.0, Angra implements native equivalents for the common inner-loop tasks above rather than hosting Maven's full plugin model. Post-1.0 compatibility should use the Rust driver plus JVM worker boundary if plugin execution becomes a target.
 - **Multi-language**: Kotlin, Scala, Groovy, mixed-source modules.
 - **Reproducible builds**: bit-for-bit jar reproducibility, normalized timestamps.
