@@ -10,7 +10,10 @@ use crate::{
         default_alias, remove_dependency_from_manifest,
     },
     maven::{ArtifactCoordinate, ArtifactType, Coordinate, CoordinateError, Scope},
-    resolver::{PomImportOptions, ResolveOutput, import_pom, inspect_project, resolve_project},
+    resolver::{
+        FrozenResolveOutput, PomImportOptions, ResolveOutput, import_pom, inspect_project,
+        resolve_frozen_project, resolve_project,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -44,6 +47,12 @@ pub struct LockOptions {
     pub project_dir: PathBuf,
     pub offline: bool,
     pub refresh: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrozenOptions {
+    pub project_dir: PathBuf,
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +147,15 @@ pub fn lock(options: LockOptions) -> Result<ResolveOutput, CommandError> {
         options.offline,
         options.refresh,
     ))?)
+}
+
+pub fn resolve_frozen(options: FrozenOptions) -> Result<FrozenResolveOutput, CommandError> {
+    Ok(resolve_frozen_project(ResolveOptions {
+        project_dir: options.project_dir,
+        offline: options.offline,
+        refresh: false,
+        local_repo: None,
+    })?)
 }
 
 pub fn import_pom_manifest(

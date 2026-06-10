@@ -1233,3 +1233,324 @@ fn init_add_and_remove_manage_manifest_and_lockfile() {
     let lockfile = fs::read_to_string(project.path().join("angra.lock")).unwrap();
     assert!(lockfile.contains("artifacts = []"));
 }
+
+#[test]
+fn resolve_frozen_verifies_lockfile_without_rewriting_it() {
+    let project = TempDir::new().unwrap();
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(&local_repo, "com.example", "demo", "1.0.0", "<project/>");
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        demo = "com.example:demo:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let resolve = Command::new(binary)
+        .args([
+            "resolve",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(
+        resolve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolve.stderr)
+    );
+    let lock_before = fs::read_to_string(project.path().join("angra.lock")).unwrap();
+    assert!(lock_before.contains("manifest_fingerprint = \""));
+
+    // Reformat the manifest without changing dependency intent; frozen must
+    // still accept it.
+    fs::write(
+        project.path().join("angra.toml"),
+        "# comment\n[dependencies]\ndemo = { group = \"com.example\", artifact = \"demo\", version = \"1.0.0\" }\n",
+    )
+    .unwrap();
+
+    let frozen = Command::new(binary)
+        .args([
+            "resolve",
+            "--frozen",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(
+        frozen.status.success(),
+        "{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert!(String::from_utf8_lossy(&frozen.stdout).contains("verified"));
+    assert_eq!(
+        lock_before,
+        fs::read_to_string(project.path().join("angra.lock")).unwrap()
+    );
+}
+
+#[test]
+fn resolve_frozen_fails_without_lockfile() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        demo = "com.example:demo:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let frozen = Command::new(binary)
+        .args([
+            "resolve",
+            "--frozen",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(!frozen.status.success());
+    let stderr = String::from_utf8_lossy(&frozen.stderr);
+    assert!(stderr.contains("angra.lock"), "{stderr}");
+    assert!(stderr.contains("run `angra lock`"), "{stderr}");
+}
+
+#[test]
+fn resolve_frozen_fails_on_manifest_drift() {
+    let project = TempDir::new().unwrap();
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(&local_repo, "com.example", "demo", "1.0.0", "<project/>");
+    write_artifact(&local_repo, "com.example", "extra", "2.0.0", "<project/>");
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        demo = "com.example:demo:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let resolve = Command::new(binary)
+        .args([
+            "resolve",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(
+        resolve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolve.stderr)
+    );
+
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        demo = "com.example:demo:1.0.0"
+        extra = "com.example:extra:2.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let frozen = Command::new(binary)
+        .args([
+            "resolve",
+            "--frozen",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(!frozen.status.success());
+    let stderr = String::from_utf8_lossy(&frozen.stderr);
+    assert!(stderr.contains("angra.toml` has changed"), "{stderr}");
+}
+
+#[test]
+fn resolve_frozen_fails_on_tampered_artifact() {
+    let project = TempDir::new().unwrap();
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(&local_repo, "com.example", "demo", "1.0.0", "<project/>");
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        demo = "com.example:demo:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let resolve = Command::new(binary)
+        .args([
+            "resolve",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(
+        resolve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolve.stderr)
+    );
+
+    fs::write(
+        local_repo
+            .join("com/example/demo/1.0.0")
+            .join("demo-1.0.0.jar"),
+        "tampered contents",
+    )
+    .unwrap();
+
+    let frozen = Command::new(binary)
+        .args([
+            "resolve",
+            "--frozen",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(!frozen.status.success());
+    let stderr = String::from_utf8_lossy(&frozen.stderr);
+    assert!(stderr.contains("does not match `angra.lock`"), "{stderr}");
+}
+
+#[test]
+fn resolve_frozen_offline_fails_when_artifact_missing_locally() {
+    let project = TempDir::new().unwrap();
+    let local_repo = project.path().join(".m2").join("repository");
+    write_artifact(&local_repo, "com.example", "demo", "1.0.0", "<project/>");
+    fs::write(
+        project.path().join("angra.toml"),
+        r#"
+        [dependencies]
+        demo = "com.example:demo:1.0.0"
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let resolve = Command::new(binary)
+        .args([
+            "resolve",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(
+        resolve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolve.stderr)
+    );
+
+    fs::remove_file(
+        local_repo
+            .join("com/example/demo/1.0.0")
+            .join("demo-1.0.0.jar"),
+    )
+    .unwrap();
+
+    let frozen = Command::new(binary)
+        .args([
+            "resolve",
+            "--frozen",
+            "--offline",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(!frozen.status.success());
+    let stderr = String::from_utf8_lossy(&frozen.stderr);
+    assert!(stderr.contains("--offline"), "{stderr}");
+}
+
+#[test]
+fn resolve_frozen_downloads_missing_artifact_and_verifies_checksum() {
+    let project = TempDir::new().unwrap();
+    let remote = TempDir::new().unwrap();
+    write_remote_artifact(remote.path(), "com.example", "demo", "1.0.0", "<project/>");
+    let repository_url = serve_directory(remote.path().to_path_buf());
+
+    fs::write(
+        project.path().join("angra.toml"),
+        format!(
+            r#"
+            [repositories]
+            remote = "{repository_url}"
+
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            "#
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_angra");
+    let resolve = Command::new(binary)
+        .args(["resolve", "--project-dir", project.path().to_str().unwrap()])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(
+        resolve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolve.stderr)
+    );
+
+    // Wipe the local repository to simulate a clean checkout on CI.
+    let local_repo = project.path().join(".m2").join("repository");
+    fs::remove_dir_all(&local_repo).unwrap();
+
+    let frozen = Command::new(binary)
+        .args([
+            "resolve",
+            "--frozen",
+            "--project-dir",
+            project.path().to_str().unwrap(),
+        ])
+        .env("HOME", project.path())
+        .output()
+        .unwrap();
+    assert!(
+        frozen.status.success(),
+        "{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert!(
+        local_repo
+            .join("com/example/demo/1.0.0")
+            .join("demo-1.0.0.jar")
+            .exists()
+    );
+}

@@ -43,6 +43,15 @@ impl ChecksumPolicy {
             _ => Self::Fail,
         }
     }
+
+    pub fn as_token(&self) -> &str {
+        match self {
+            Self::Fail => "fail",
+            Self::Warn => "warn",
+            Self::Ignore => "ignore",
+            Self::Unknown(value) => value,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

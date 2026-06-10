@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use angra::{
     ResolveError,
     commands::{
-        self, AddOptions, CommandError, ImportPomCommandOptions, InitOptions, LockOptions,
-        RemoveOptions,
+        self, AddOptions, CommandError, FrozenOptions, ImportPomCommandOptions, InitOptions,
+        LockOptions, RemoveOptions,
     },
     maven::{ArtifactCoordinate, ArtifactType, Scope},
 };
@@ -114,6 +114,11 @@ enum Command {
         /// Re-check remote artifacts even when local files already exist.
         #[arg(long)]
         refresh: bool,
+
+        /// Install exactly what angra.lock records and fail on manifest drift,
+        /// instead of re-resolving.
+        #[arg(long, conflicts_with = "refresh")]
+        frozen: bool,
 
         /// Project directory containing angra.toml.
         #[arg(long, default_value = ".")]
@@ -269,11 +274,6 @@ fn run() -> Result<(), CommandError> {
             offline,
             refresh,
             project_dir,
-        }
-        | Command::Resolve {
-            offline,
-            refresh,
-            project_dir,
         } => {
             let output = commands::lock(LockOptions {
                 project_dir,
@@ -282,6 +282,34 @@ fn run() -> Result<(), CommandError> {
             })?;
             print_warnings(&output.warnings);
             print_lock_success(output.lockfile.artifacts.len());
+        }
+        Command::Resolve {
+            offline,
+            refresh,
+            frozen,
+            project_dir,
+        } => {
+            if frozen {
+                let output = commands::resolve_frozen(FrozenOptions {
+                    project_dir,
+                    offline,
+                })?;
+                print_warnings(&output.warnings);
+                println!(
+                    "{} verified {} artifacts against {}",
+                    paint("success:", GREEN),
+                    paint(&output.lockfile.artifacts.len().to_string(), BOLD),
+                    paint("angra.lock", CYAN)
+                );
+            } else {
+                let output = commands::lock(LockOptions {
+                    project_dir,
+                    offline,
+                    refresh,
+                })?;
+                print_warnings(&output.warnings);
+                print_lock_success(output.lockfile.artifacts.len());
+            }
         }
         Command::Tree {
             offline,

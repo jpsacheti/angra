@@ -176,6 +176,72 @@ pub fn inspect_project(options: ResolveOptions) -> Result<ResolveOutput, Resolve
     resolve_project_inner(options, false)
 }
 
+#[derive(Debug, Clone)]
+pub struct FrozenResolveOutput {
+    pub lockfile: Lockfile,
+    pub warnings: Vec<String>,
+}
+
+/// Install exactly what `angra.lock` records, without re-resolving.
+///
+/// The lockfile is authoritative: the manifest fingerprint must match, every
+/// locked artifact is fetched at its locked concrete version (no metadata
+/// lookups, no graph traversal), and artifact contents must match the locked
+/// SHA-256. The lockfile is never rewritten.
+pub fn resolve_frozen_project(
+    options: ResolveOptions,
+) -> Result<FrozenResolveOutput, ResolveError> {
+    let manifest_path = options.project_dir.join("angra.toml");
+    let manifest = Manifest::read(&manifest_path)?;
+    let lock_path = options.project_dir.join("angra.lock");
+    if !lock_path.exists() {
+        return Err(ResolveError::FrozenMissingLockfile(lock_path));
+    }
+    let lockfile = Lockfile::read(&lock_path)?;
+    if lockfile.version != 1 {
+        return Err(ResolveError::FrozenUnsupportedLockfile(lockfile.version));
+    }
+    let fingerprint = manifest.resolver_fingerprint()?;
+    if lockfile.manifest_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+        return Err(ResolveError::FrozenManifestDrift);
+    }
+
+    let global_config = GlobalConfig::load()?;
+    let settings = MavenSettings::load()?;
+    let mut activation_properties = settings.properties.clone();
+    activation_properties.extend(manifest.resolver.maven.properties.clone());
+    let profile_activation = ProfileActivationContext::new(
+        manifest.resolver.maven.active_profiles.clone(),
+        manifest.resolver.maven.inactive_profiles.clone(),
+        activation_properties,
+        manifest.resolver.maven.java_version.clone(),
+        options.project_dir.clone(),
+    );
+    let mut repositories =
+        manifest.declared_repositories(&global_config.repositories(), &settings.repositories);
+    settings.apply_mirrors(&mut repositories);
+    let local_repo = options
+        .local_repo
+        .or(settings.local_repository.clone())
+        .map(Ok)
+        .unwrap_or_else(default_local_repo)?;
+    let resolver = Resolver::new_with_activation(
+        local_repo,
+        repositories,
+        settings,
+        profile_activation,
+        options.offline,
+        false,
+    )?;
+
+    for locked in &lockfile.artifacts {
+        resolver.ensure_frozen_artifact(locked)?;
+    }
+
+    let warnings = resolver.into_warnings();
+    Ok(FrozenResolveOutput { lockfile, warnings })
+}
+
 pub fn import_pom(options: PomImportOptions) -> Result<PomImportOutput, ResolveError> {
     let pom_path = options.pom_path;
     let project_dir = pom_path
@@ -360,6 +426,7 @@ fn resolve_project_inner(
 ) -> Result<ResolveOutput, ResolveError> {
     let manifest_path = options.project_dir.join("angra.toml");
     let manifest = Manifest::read(&manifest_path)?;
+    let manifest_fingerprint = manifest.resolver_fingerprint()?;
     let dependencies = manifest.declared_dependencies()?;
     let dependency_management = manifest.declared_dependency_management()?;
     let global_config = GlobalConfig::load()?;
@@ -395,6 +462,7 @@ fn resolve_project_inner(
     let graph = ResolutionGraph::from_artifacts(&artifacts);
 
     let lockfile = Lockfile::new(
+        Some(manifest_fingerprint),
         artifacts
             .into_iter()
             .map(|artifact| {
@@ -955,6 +1023,51 @@ impl Resolver {
             requested_version: resolved.requested_version,
             source,
         })
+    }
+
+    /// Ensure a locked artifact is present locally and matches its locked SHA-256.
+    ///
+    /// Unlike `ensure_artifact`, the locked version is final: no range or
+    /// SNAPSHOT metadata resolution happens here. Cached files are verified
+    /// too — frozen mode is the integrity gate, so it pays the hash cost that
+    /// normal warm-cache resolution skips.
+    fn ensure_frozen_artifact(&self, locked: &LockedArtifact) -> Result<(), ResolveError> {
+        let artifact = locked.artifact_coordinate();
+        let pom_path = artifact.pom_path(&self.local_repo);
+        let artifact_path = artifact.artifact_path(&self.local_repo);
+        let descriptor_only =
+            artifact.artifact_type == ArtifactType::Pom && artifact.classifier.is_none();
+
+        if !(pom_path.exists() && (descriptor_only || artifact_path.exists())) {
+            if self.offline {
+                return Err(ResolveError::OfflineMissing(artifact.to_string()));
+            }
+
+            self.download_artifact(
+                &artifact,
+                locked.requested_version.as_deref(),
+                &self.repositories,
+                &pom_path,
+                &artifact_path,
+                descriptor_only,
+            )?;
+        }
+
+        let Some(expected) = locked.artifact_sha256.as_deref() else {
+            return Err(ResolveError::FrozenMissingChecksum {
+                artifact: artifact.to_string(),
+            });
+        };
+        let actual = sha256_file(&artifact_path)?;
+        if actual != expected {
+            return Err(ResolveError::FrozenChecksumMismatch {
+                artifact: artifact.to_string(),
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+
+        Ok(())
     }
 
     fn resolve_artifact_version(
@@ -1593,6 +1706,26 @@ pub enum ResolveError {
     MissingHome,
     #[error("artifact `{0}` is missing locally and --offline was used")]
     OfflineMissing(String),
+    #[error("`angra.lock` was not found at `{0}`; run `angra lock` before resolving with --frozen")]
+    FrozenMissingLockfile(PathBuf),
+    #[error("unsupported `angra.lock` version {0}; run `angra lock` to regenerate it")]
+    FrozenUnsupportedLockfile(u32),
+    #[error(
+        "`angra.toml` has changed since `angra.lock` was written (or the lockfile predates --frozen support); run `angra lock` to update it"
+    )]
+    FrozenManifestDrift,
+    #[error(
+        "artifact `{artifact}` has no recorded checksum in `angra.lock`; run `angra lock` to regenerate it"
+    )]
+    FrozenMissingChecksum { artifact: String },
+    #[error(
+        "artifact `{artifact}` does not match `angra.lock`: expected sha256 `{expected}`, found `{actual}`; run `angra lock` if this change is intentional"
+    )]
+    FrozenChecksumMismatch {
+        artifact: String,
+        expected: String,
+        actual: String,
+    },
     #[error("artifact `{artifact}` was not found in configured repositories {repositories:?}")]
     ArtifactNotFound {
         artifact: String,

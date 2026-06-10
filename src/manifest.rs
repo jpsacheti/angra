@@ -310,6 +310,78 @@ impl Manifest {
             .collect()
     }
 
+    /// Hash the resolver-relevant manifest intent for `angra.lock` drift detection.
+    ///
+    /// Computed from parsed declarations, not raw TOML text, so formatting and
+    /// comment edits do not invalidate a lockfile. Covers dependencies,
+    /// dependency management, project repositories, and `[resolver.maven]`
+    /// controls; machine-global state (global config, Maven settings) is
+    /// excluded so lockfiles stay portable across machines.
+    pub fn resolver_fingerprint(&self) -> Result<String, ManifestError> {
+        use sha2::{Digest, Sha256};
+
+        fn exclusion_list(exclusions: &[Coordinate]) -> String {
+            exclusions
+                .iter()
+                .map(|exclusion| format!("{}:{}", exclusion.group, exclusion.artifact))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        let mut canonical = String::from("angra-manifest-fingerprint v1\n");
+        for dependency in self.declared_dependencies()? {
+            canonical.push_str(&format!(
+                "dependency {} {} scope={} exclusions={}\n",
+                dependency.alias,
+                dependency.artifact,
+                dependency.scope,
+                exclusion_list(&dependency.exclusions),
+            ));
+        }
+        for managed in self.declared_dependency_management()? {
+            let scope = match managed.scope {
+                ManagedDependencyScope::None => "none".to_string(),
+                ManagedDependencyScope::Graph(scope) => scope.to_string(),
+                ManagedDependencyScope::Import => "import".to_string(),
+            };
+            canonical.push_str(&format!(
+                "managed {} {} scope={scope} exclusions={}\n",
+                managed.alias,
+                managed.artifact,
+                exclusion_list(&managed.exclusions),
+            ));
+        }
+        for (name, spec) in &self.repositories {
+            let repository = spec.to_repository(name);
+            canonical.push_str(&format!(
+                "repository {} {} releases={}/{} snapshots={}/{}\n",
+                repository.name,
+                repository.url,
+                repository.releases.enabled,
+                repository.releases.checksum_policy.as_token(),
+                repository.snapshots.enabled,
+                repository.snapshots.checksum_policy.as_token(),
+            ));
+        }
+        let maven = &self.resolver.maven;
+        for profile in &maven.active_profiles {
+            canonical.push_str(&format!("active-profile {profile}\n"));
+        }
+        for profile in &maven.inactive_profiles {
+            canonical.push_str(&format!("inactive-profile {profile}\n"));
+        }
+        if let Some(java_version) = &maven.java_version {
+            canonical.push_str(&format!("java-version {java_version}\n"));
+        }
+        for (key, value) in &maven.properties {
+            canonical.push_str(&format!("property {key}={value}\n"));
+        }
+
+        Ok(faster_hex::hex_string(&Sha256::digest(
+            canonical.as_bytes(),
+        )))
+    }
+
     /// Return repositories with global config and Maven settings merged in.
     ///
     /// Precedence by name: project repos override global repos, which override settings repos.
@@ -677,6 +749,114 @@ pub enum ManifestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fingerprint(toml: &str) -> String {
+        toml::from_str::<Manifest>(toml)
+            .unwrap()
+            .resolver_fingerprint()
+            .unwrap()
+    }
+
+    #[test]
+    fn fingerprint_ignores_formatting_and_comments() {
+        let compact = fingerprint(
+            r#"
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            "#,
+        );
+        let reformatted = fingerprint(
+            "# a comment\n[project]\nartifact = \"app\"\n\n[dependencies]\ndemo = \"com.example:demo:1.0.0\" # trailing\n",
+        );
+        assert_eq!(compact, reformatted);
+    }
+
+    #[test]
+    fn fingerprint_matches_equivalent_compact_and_structured_dependencies() {
+        let compact = fingerprint(
+            r#"
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            "#,
+        );
+        let structured = fingerprint(
+            r#"
+            [dependencies]
+            demo = { group = "com.example", artifact = "demo", version = "1.0.0" }
+            "#,
+        );
+        assert_eq!(compact, structured);
+    }
+
+    #[test]
+    fn fingerprint_changes_on_resolver_relevant_edits() {
+        let base = fingerprint(
+            r#"
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            "#,
+        );
+
+        let version_bump = fingerprint(
+            r#"
+            [dependencies]
+            demo = "com.example:demo:1.0.1"
+            "#,
+        );
+        let added = fingerprint(
+            r#"
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            extra = "com.example:extra:2.0.0"
+            "#,
+        );
+        let removed = fingerprint("");
+        let scoped = fingerprint(
+            r#"
+            [dependencies]
+            demo = { group = "com.example", artifact = "demo", version = "1.0.0", scope = "test" }
+            "#,
+        );
+        let repo = fingerprint(
+            r#"
+            [repositories]
+            internal = "https://repo.example.com/releases"
+
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            "#,
+        );
+        let managed = fingerprint(
+            r#"
+            [dependency-management]
+            bom = { group = "com.example", artifact = "bom", version = "1.0.0", type = "pom", scope = "import" }
+
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            "#,
+        );
+        let profiles = fingerprint(
+            r#"
+            [resolver.maven]
+            active-profiles = ["dev"]
+
+            [dependencies]
+            demo = "com.example:demo:1.0.0"
+            "#,
+        );
+
+        for changed in [
+            version_bump,
+            added,
+            removed,
+            scoped,
+            repo,
+            managed,
+            profiles,
+        ] {
+            assert_ne!(base, changed);
+        }
+    }
 
     #[test]
     fn writes_manifest_with_workspace_and_structured_dependencies() {

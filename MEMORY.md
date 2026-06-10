@@ -65,6 +65,8 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - Lockfile artifact fields are artifact-neutral: use `artifact_path`, `artifact_sha256`, `type`, and optional `classifier`. Avoid jar-specific naming.
 - Dependency paths are diagnostics only. Do not persist resolver provenance in `angra.lock`.
 - Lockfiles record concrete resolved versions for ranges and timestamped SNAPSHOTs. When the requested version differs, `requested_version` records the original range or `-SNAPSHOT` request.
+- `angra.lock` carries an optional `manifest_fingerprint`: SHA-256 over canonical resolver-relevant manifest intent (dependencies, dependency management, project repositories, `[resolver.maven]`). It is an input digest for `--frozen` drift detection, not resolver provenance; machine-global config and Maven settings are excluded so lockfiles stay portable.
+- `angra resolve --frozen` installs exactly the locked artifacts (no metadata lookups, no graph traversal, never rewrites the lock) and verifies every artifact against its locked SHA-256 — including cached files, a deliberate frozen-only exception to the warm-cache no-reverify rule. Locked `pom_path`/`artifact_path` are informational; frozen recomputes paths from coordinates against the current local repo.
 
 ## Repository And Config Decisions
 
@@ -198,6 +200,12 @@ Durable project memory for Angra. Keep this file compact: record decisions that 
 - **What was decided:** Reopened the Tokio question and deferred the call until angra accumulates a real async workload (e.g. concurrent background indexer, watch-mode resolver, or live registry streaming). Re-evaluation trigger: a concrete async-shaped feature lands in the roadmap.
 - **Why:** Current `thread::scope` + `mpsc` work-queue in `Resolver::ensure_artifacts_parallel` already hits the 5.7x-over-Maven target, and the blocking `reqwest` path has no measured cold-network pain. Adopting Tokio now would add compile-time and dependency weight without a clear bottleneck to solve.
 - **Rejected and why:** Adopting Tokio speculatively (ahead of an async feature) was rejected because it would couple the project to a runtime before a real driver exists, mirroring the 0.2 rejection at MEMORY.md:185. Switching only the parallel-fetch loop to async was rejected for now because it would split the codebase into two concurrency styles with no measured benefit.
+
+## Decision Entry - 2026-06-09 (Frozen Resolve Implementation)
+
+- **What was decided:** Implemented `angra resolve --frozen` as the lockfile-authoritative CI install path. Drift detection uses a new optional `manifest_fingerprint` field in `angra.lock`: SHA-256 over a versioned canonical rendering of resolver-relevant manifest intent (declared dependencies, dependency management, project repositories with policies, `[resolver.maven]` controls), computed from parsed declarations rather than raw TOML. Frozen mode skips all version/metadata resolution, fetches missing locked artifacts through the existing repository machinery, verifies every artifact (cached or downloaded) against its locked SHA-256, never rewrites the lockfile, and `--frozen` conflicts with `--refresh` at the CLI.
+- **Why:** Without an authoritative-lock mode the lockfile is informational; CI needs "install the lock, fail loudly on drift". Hashing parsed intent keeps formatting/comment edits from invalidating locks, and equivalent compact/structured declarations fingerprint identically. Excluding global config and settings.xml keeps lockfiles portable across machines.
+- **Rejected and why:** Hashing raw manifest text was rejected (false drift on cosmetic edits). Checking that each declared root appears in the lock was rejected (cannot detect removals without provenance). Recording declared roots in the lockfile was rejected as a larger format change than needed. Two logged decisions were touched deliberately: the fingerprint is an input digest, not resolver provenance, so the artifact-only lockfile decision stands; and frozen mode re-verifies cached artifact hashes as an explicit, opt-in exception to the warm-cache no-reverify rule — normal `resolve`/`lock` behavior is unchanged.
 
 ## Decision Entry - 2026-06-09 (Roadmap Review Additions)
 

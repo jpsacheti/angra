@@ -15,6 +15,7 @@ manifest lifecycle commands.
 - `angra import-pom`
 - `angra add` / `angra remove`
 - `angra lock` / `angra resolve`
+- `angra resolve --frozen` — lockfile-authoritative installs with manifest drift detection and SHA-256 verification
 - `angra tree` / `angra why`
 - `angra.toml` as the project manifest
 - Compact Maven coordinates:
@@ -118,6 +119,14 @@ Force a remote re-check:
 
 ```sh
 angra resolve --refresh
+```
+
+Install exactly what `angra.lock` records, without re-resolving (CI-friendly —
+fails if the manifest drifted from the lockfile or an artifact does not match
+its locked SHA-256):
+
+```sh
+angra resolve --frozen
 ```
 
 Start from an existing Maven project:
